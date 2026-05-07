@@ -1,0 +1,84 @@
+# ===== Game install — never commit copyrighted binaries =====
+Game/
+*.exe
+*.dll
+*.bik
+*.bnk
+*.dbl
+*.dct
+
+# ===== IDA Pro working files (per-user, large, regenerable) =====
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.t01
+*.t02
+
+# ===== Inspection scratchpad =====
+_inspect/
+
+# ===== Heavy local working data (per-machine, not collaboration-relevant) =====
+ida/dumps/
+*.7z
+tools/x64dbg_snapshot*/
+__pycache__/
+
+# ===== Build output =====
+build/
+out/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.ipdb
+*.iobj
+*.asi
+
+# ===== CMake =====
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.in
+compile_commands.json
+
+# ===== Visual Studio =====
+.vs/
+*.user
+*.sln.docstates
+*.suo
+*.userprefs
+
+# ===== JetBrains =====
+.idea/
+
+# ===== VS Code =====
+.vscode/
+!.vscode/launch.example.json
+!.vscode/tasks.example.json
+
+# ===== OS junk =====
+Thumbs.db
+ehthumbs.db
+.DS_Store
+desktop.ini
+
+# ===== Temporary / log =====
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# ===== Claude Code local settings (machine-specific) =====
+.claude/settings.local.json
+
+# ===== Allow-list (override the broad *.exe / *.dll bans for our own outputs) =====
+!src/**/*.dll
+!tools/**/*.exe

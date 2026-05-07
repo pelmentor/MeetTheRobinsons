@@ -1,0 +1,13 @@
+# findings/
+
+One file per topic / system as RE progresses. Templates:
+
+- `camera.md`
+- `renderer.md`
+- `main-loop.md`
+- `main-menu.md`
+- `securom-dump-notes.md`
+- `config-schema.md`
+
+See [../../docs/REVERSE_ENGINEERING.md](../../docs/REVERSE_ENGINEERING.md) for
+the per-file structure expected.
