@@ -1,8 +1,28 @@
 # SecuROM 7 — analysis & unpacking procedure for `Wilbur.exe`
 
-This document explains *why* IDA Pro can't auto-analyze `Wilbur.exe` out of the box,
-*how* we know it's protected, and the agreed procedure for producing a clean
-unpacked binary that IDA can analyze.
+> **2026-05-08 reality check.** SecuROM does not block analysis on this build
+> anymore. The unpack ran, `ida/400000.Wilbur.exe.i64` is the working IDB
+> with 12,555 functions, and full RE of the stub
+> ([`../research/findings/securom7-stub-re.md`](../research/findings/securom7-stub-re.md))
+> proved the "encryption" was just aPLib decompression + BCJ-86 byte filter
+> + custom IAT resolver — **no per-page lazy decryption, no live encryption**.
+>
+> What looks like "SecuROM thunks" in the unpacked IDB (e.g.
+> `sub_4E0B90 = jmp [F92F34]`) is just the loader's IAT-resolver output:
+> stolen-byte wrappers that point at plain decompilable code. One extra
+> hop, no wall.
+>
+> See `feedback_securom_terminology_2026-05-08` in the auto-memory for
+> the canonical terminology rule. **Don't frame current-time analysis
+> failures as "blocked on SecuROM" on this build.** They're either (1)
+> IDA auto-analysis gaps in plaintext code, or (2) stolen-byte IAT
+> hops — both are reachable.
+
+This document explains *why* IDA Pro couldn't auto-analyze `Wilbur.exe`
+straight off disk (the on-disk file IS SecuROM-7 packed), *how* we
+verified that, and the procedure that produced our clean unpacked
+binary. It is **historical reference for the unpack** — once you've
+got the IDB, the rest of this document does not apply to ongoing RE.
 
 > **2026-05-05 update.** M1 (initial unpack via PE-sieve `/imp 3`) is **done** —
 > we have a working IDA database at `ida/400000.Wilbur.exe.i64` with 12,555 functions.

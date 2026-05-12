@@ -104,8 +104,8 @@ bool set(float v) {
 
 // "Force every object visible" patch — localised 5-byte call-site rewrites
 // at EVERY call site of sub_4E0B90 (the per-object visibility test, a
-// SecuROM thunk that returns a struct pointer; callers use only AL as
-// "is visible" flag). Replacing each `call sub_4E0B90` with
+// stolen-byte IAT thunk that returns a struct pointer; callers use only
+// AL as "is visible" flag). Replacing each `call sub_4E0B90` with
 // `mov al, 1; nop*3` forces all 4 callers' visibility checks to pass.
 //
 // Earlier version patched only 0x4C385D (sub_4C3790's call). Insufficient:
@@ -221,7 +221,11 @@ void set(bool on) {
 namespace mtr::draw_dist {
 
 namespace {
-std::atomic<float> g_target {0.0f};
+// 50k default override (2026-05-09 user request). Engine default of 1500
+// units pops geometry visibly close to the camera; 50k matches the
+// commonly-used preset and is comfortable for the typical play screens
+// without z-fighting. User can still change/disable via the World tab.
+std::atomic<float> g_target {50000.0f};
 }
 
 float current()      { return g_target.load(); }
@@ -229,9 +233,12 @@ bool  has_override() { return g_target.load() > 0.0f; }
 
 bool set(float v) {
     if (v < 0.0f) return false;
-    if (v > 0.0f && (v < 100.0f || v > 200000.0f)) return false;
+    // No upper clamp. Above ~1e7 z-precision degrades and z-fighting kicks
+    // in but that's the user's call — let them shoot themselves in the
+    // foot if they want infinite-distance gameplay screenshots.
+    if (v > 0.0f && v < 1.0f) return false;
     g_target.store(v);
-    if (v > 0.0f) mtr::log::info("draw_dist: override = %.0f", v);
+    if (v > 0.0f) mtr::log::info("draw_dist: override = %.1f", v);
     else          mtr::log::info("draw_dist: override cleared");
     return true;
 }
@@ -275,6 +282,7 @@ float* as_float(uintptr_t va) { return reinterpret_cast<float*>(va); }
 
 std::atomic<bool> g_fog_disabled{false};
 std::atomic<bool> g_side_cull_disabled{false};
+std::atomic<bool> g_no_backface_cull{false};
 }
 
 float clip_near()           { return *as_float(kClipNearVA); }
@@ -294,6 +302,7 @@ void set_fog_far(float v)           { if (v > 0.0f) *as_float(kFogFarVA)       =
 
 bool fog_disabled()                 { return g_fog_disabled.load(); }
 bool side_cull_disabled()           { return g_side_cull_disabled.load(); }
+bool no_backface_cull()             { return g_no_backface_cull.load(); }
 
 void set_fog_disabled(bool v) {
     g_fog_disabled.store(v);
@@ -306,6 +315,11 @@ void set_fog_disabled(bool v) {
 void set_side_cull_disabled(bool v) {
     g_side_cull_disabled.store(v);
     mtr::log::info("scene: side_cull_disabled = %d", v ? 1 : 0);
+}
+
+void set_no_backface_cull(bool v) {
+    g_no_backface_cull.store(v);
+    mtr::log::info("scene: no_backface_cull = %d", v ? 1 : 0);
 }
 
 // Pumped each frame by hk_PerCameraApply when fog is set to disabled, so
@@ -339,25 +353,22 @@ void enforce_fog_disabled() {
 //     +0x14  FARCAMERA
 //     +0x18  OFFCAMERA
 //
-// PeripheryRejectAngle is the prime suspect for the user-reported "corner
-// culling" symptom: with the default 22.5 deg cone, anything outside that
-// half-angle from view direction is eligible for periphery rejection at
-// PeripheryRejectDist. Setting the angle to >= pi/2 (90 deg) effectively
-// disables the angle test; setting the distance very large disables the
-// distance test. Both are pure data writes — no patches, no thunks.
-//
 // LODScale is the global multiplier applied to all LOD distances when the
 // engine decides "is this object close enough to render at high detail".
 // Setting LODScale > 1 pushes detail farther; < 1 pulls it in.
+//
+// (Periphery cvars at 0x745B50/0x745B54/0x745B58 were RE'd and exposed in
+// an earlier UI section, but turned out to have no observable effect at
+// runtime — the corner-cull symptom they were meant to address is owned
+// by the per-object frustum cull at g_cull_frustum (0x726498). See
+// research/findings/peripheral-cull-pipeline-2026-05-09.md. Removed to
+// avoid misleading UX.)
 namespace mtr::lod {
 
 namespace {
 constexpr uintptr_t kFocusDistVA            = 0x00745B44;
 constexpr uintptr_t kHighDistVA             = 0x00745B48;
 constexpr uintptr_t kMediumDistVA           = 0x00745B4C;
-constexpr uintptr_t kPeripheryAcceptDistVA  = 0x00745B50;
-constexpr uintptr_t kPeripheryRejectDistVA  = 0x00745B54;
-constexpr uintptr_t kPeripheryRejectAngleVA = 0x00745B58;  // RADIANS
 
 constexpr uintptr_t kLODScaleVA             = 0x00745B7C;
 constexpr uintptr_t kOnCameraVA             = 0x00745B80;
@@ -372,16 +383,10 @@ float* as_float(uintptr_t va) { return reinterpret_cast<float*>(va); }
 float focus_dist()              { return *as_float(kFocusDistVA); }
 float high_dist()               { return *as_float(kHighDistVA); }
 float medium_dist()             { return *as_float(kMediumDistVA); }
-float periphery_accept_dist()   { return *as_float(kPeripheryAcceptDistVA); }
-float periphery_reject_dist()   { return *as_float(kPeripheryRejectDistVA); }
-float periphery_reject_angle()  { return *as_float(kPeripheryRejectAngleVA); }
 
 void set_focus_dist(float v)            { if (v >= 0.0f) *as_float(kFocusDistVA)            = v; }
 void set_high_dist(float v)             { if (v >= 0.0f) *as_float(kHighDistVA)             = v; }
 void set_medium_dist(float v)           { if (v >= 0.0f) *as_float(kMediumDistVA)           = v; }
-void set_periphery_accept_dist(float v) { if (v >= 0.0f) *as_float(kPeripheryAcceptDistVA)  = v; }
-void set_periphery_reject_dist(float v) { if (v >= 0.0f) *as_float(kPeripheryRejectDistVA)  = v; }
-void set_periphery_reject_angle(float v_rad) { if (v_rad >= 0.0f) *as_float(kPeripheryRejectAngleVA) = v_rad; }
 
 float lod_scale()       { return *as_float(kLODScaleVA); }
 float on_camera()       { return *as_float(kOnCameraVA); }
@@ -396,60 +401,6 @@ void set_near_camera(float v)   { if (v >= 0.0f) *as_float(kNearCameraVA)  = v; 
 void set_medium_camera(float v) { if (v >= 0.0f) *as_float(kMediumCameraVA)= v; }
 void set_far_camera(float v)    { if (v >= 0.0f) *as_float(kFarCameraVA)   = v; }
 void set_off_camera(float v)    { if (v >= 0.0f) *as_float(kOffCameraVA)   = v; }
-
-// Convenience: disable periphery rejection.
-//
-// IMPORTANT cvar-storage encoding (RE'd from console_register_var_typed_c
-// callbacks in sub_67FED0):
-//
-//   PeripheryRejectAngle storage = cos²(half_cone_deg)
-//     setter sub_67FE70(deg) -> cos²(deg * π/180)
-//     getter sub_67FE90(stored) -> acos(sqrt(stored)) * 180/π
-//     -> default 0.39 means cos²(angle) = 0.39 -> angle ≈ 51°
-//     -> to disable, write 0.0 (= cos²(90°) = full hemisphere)
-//
-//   PeripheryRejectDist storage = dist² (squared distance)
-//     setter sub_429D20(real) -> real² (the COMMON "real" setter)
-//     getter sub_401E50(stored) -> sqrt(stored)
-//     -> default 1500.0 means dist² = 1500 -> dist ≈ 38.7 units
-//        OR (more likely) the pre-init writes 1500 raw and the common
-//        setter is only used for console-input convenience. Write 1e12
-//        either way: covers both storage interpretations.
-void disable_periphery_cull() {
-    *as_float(kPeripheryRejectAngleVA) = 0.0f;              // cos²(90°), full hemisphere
-    *as_float(kPeripheryRejectDistVA)  = 1.0e12f;           // covers dist or dist² semantics
-}
-void restore_periphery_cull_defaults() {
-    *as_float(kPeripheryRejectAngleVA) = 0.39f;             // engine default cos²(~51°)
-    *as_float(kPeripheryRejectDistVA)  = 1500.0f;
-}
-
-// Decoders: turn the raw stored value back into the "user-friendly" units
-// (degrees / linear distance) for UI display.
-float periphery_reject_angle_deg() {
-    const float stored = *as_float(kPeripheryRejectAngleVA);
-    if (stored <= 0.0f) return 90.0f;
-    if (stored >= 1.0f) return 0.0f;
-    const float c = sqrtf(stored);   // = |cos(angle)|
-    return acosf(c) * (180.0f / 3.14159265f);
-}
-void set_periphery_reject_angle_deg(float deg) {
-    if (deg < 0.0f) deg = 0.0f;
-    if (deg > 90.0f) deg = 90.0f;
-    const float c = cosf(deg * (3.14159265f / 180.0f));
-    *as_float(kPeripheryRejectAngleVA) = c * c;
-}
-// Distance: assume dist² storage (most likely if common setter is invoked).
-// If raw storage interpretation turns out to be linear, sqrt of dist² is still
-// usable; user just sees a bigger number.
-float periphery_reject_dist_decoded() {
-    const float stored = *as_float(kPeripheryRejectDistVA);
-    return (stored > 0.0f) ? sqrtf(stored) : 0.0f;
-}
-void set_periphery_reject_dist_squared(float linear_dist) {
-    if (linear_dist < 0.0f) linear_dist = 0.0f;
-    *as_float(kPeripheryRejectDistVA) = linear_dist * linear_dist;
-}
 
 } // namespace mtr::lod
 

@@ -144,11 +144,58 @@ python tools/skip_intros.py --check     # report state
 
 This is a runtime sledgehammer — works because Bink is permissive about open failures. The "proper" alternative — hooking `BinkOpen` in `binkw32.dll` and short-circuiting only known intro filenames — has been designed (see [research/findings/bink-integration.md](../research/findings/bink-integration.md)) but not yet implemented. Once implemented in the mod, this script becomes legacy / fallback.
 
+### `extract_sx_identifiers.py` — `.sx` bytecode string mining
+
+Walks `Game/data/scripts/*.sx` (SLNG bytecode), extracts every printable identifier-shaped token from the interned-string tables, and aggregates per-file + per-occurrence counts.
+
+```
+python tools/extract_sx_identifiers.py                       # stdout: top 200
+python tools/extract_sx_identifiers.py --out catalog.txt     # full ranked dump to file
+python tools/extract_sx_identifiers.py --top 80              # custom rank cap
+```
+
+Used to produce the script command catalog driving the coop multiplayer plan (Phase 0C — see [research/findings/coop-phase-0c-sx-command-catalog-2026-05-11.md](../research/findings/coop-phase-0c-sx-command-catalog-2026-05-11.md)). Ranked output checked in at `tools/sx_identifiers.txt` for reference.
+
+## PowerShell scripts
+
+Newer test orchestration is in PowerShell 7 (`pwsh`) rather than Python — they wrap the Wilbur.exe lifecycle, which is most naturally expressed via PowerShell's process/CIM cmdlets.
+
+### `run-test.ps1` — single-scenario autonomous runner
+
+Wraps Wilbur.exe launch + log polling + clean shutdown for one in-mod test scenario. Pairs with [`src/mtr-asi/src/test_harness.cpp`](../src/mtr-asi/src/test_harness.cpp). See [`../docs/AUTONOMOUS_TESTING.md`](../docs/AUTONOMOUS_TESTING.md) for the design.
+
+```
+pwsh tools/run-test.ps1                                      # default: boot-to-main-menu
+pwsh tools/run-test.ps1 -Scenario load-save-1-show-ingame -Redeploy
+```
+
+### `run-coop-test.ps1` — two-process coop test orchestrator
+
+Phase 0D of the coop multiplayer plan. Three modes:
+
+```
+pwsh tools/run-coop-test.ps1 -Mode mock                       # CI-safe, no game launch
+pwsh tools/run-coop-test.ps1 -Mode single-process -HostPort 31415 \
+     -Scenario boot-to-main-menu -Redeploy
+pwsh tools/run-coop-test.ps1 -Mode dual-machine -Role host \
+     -HostPort 31415 -ClientPort 31416 -Scenario coop-ping
+```
+
+`mock` writes fixture JSONs and exercises the orchestrator's parse/aggregate logic without launching the game. `single-process` launches one Wilbur to verify the mod's `-mtrasi-coop-port=<N>` cmdline wiring writes a port-suffixed result JSON. `dual-machine` launches the local side only — the Disney named-mutex blocks same-machine dual-launch, so real two-process testing requires two physical machines or VM-isolated processes. See [`../research/findings/coop-phase-0d-test-harness-skeleton-2026-05-11.md`](../research/findings/coop-phase-0d-test-harness-skeleton-2026-05-11.md).
+
+### `run-overnight.ps1` — multi-scenario overnight orchestrator
+
+Wraps `run-test.ps1` with a 4th-layer outer-process watchdog and a scenario list, so a multi-hour soak can run unattended.
+
+### `bmp-to-png-thumb.ps1` + `validate-overlay-frames.ps1` + `kill-wilbur.ps1` + `mouse-wake.ps1`
+
+Per-purpose helpers used by the test pipeline: BMP→PNG thumbnailing (chat-shareable archives), offline math validation against archived overlay export logs, force-kill of stuck Wilbur processes, monitor-wake before launching fullscreen.
+
 ## Adding new tools
 
 Conventions:
 
-- Pure Python stdlib + `ctypes`. No `pip install` step.
+- Pure Python stdlib + `ctypes` for new Python scripts; PowerShell 7 (`pwsh`) for new shell-level scripts (orchestration around the game executable). No `pip install` step.
 - Single-file scripts under `tools/`. Use a top-of-file docstring documenting the script's job, args, and any prerequisites (e.g. "needs IDA database open").
 - Windows-API access via `ctypes.WinDLL(...)`. Don't take dependencies on `pywin32`, `psutil`, etc.
 - Output formatting: ANSI colour escapes (the runtime enables VT processing on the console handle); plain text fallback if colours fail.

@@ -41,6 +41,9 @@ namespace mtr::sprite_split {
 namespace mtr::sprite_xform {
     void process_list();
 }
+namespace mtr::widget_probe {
+    void clear_frame_table();
+}
 
 namespace mtr::sprite_probe {
 
@@ -201,10 +204,16 @@ unsigned int __cdecl wrapper_render_sprite_batcher() {
 
     // Phase 3 split-pass (experimental): if enabled, classify entries
     // and render in two passes. Otherwise just forward.
+    unsigned int rv;
     if (mtr::sprite_split::enabled()) {
-        return mtr::sprite_split::execute_split();
+        rv = mtr::sprite_split::execute_split();
+    } else {
+        rv = reinterpret_cast<PFN_RenderSpriteBatcher>(kRenderSpriteBatcherVA)();
     }
-    return reinterpret_cast<PFN_RenderSpriteBatcher>(kRenderSpriteBatcherVA)();
+    // Clear widget_probe's per-frame side-table after draw. Next frame's
+    // sub_4E9350 calls (PRE/POST) repopulate it.
+    mtr::widget_probe::clear_frame_table();
+    return rv;
 }
 
 bool install_call_site_patch() {

@@ -9,6 +9,64 @@ the original engine's display limitations on modern hardware.
 
 ---
 
+## Guiding principles
+
+This project is built under 7 architectural principles distilled from
+MTA's README + source ([reference/mtasa-blue/](reference/mtasa-blue/) —
+the canonical "retrofit multiplayer onto a single-player game via
+hook-only mod", 22+ years of experience). The principles below apply to
+every non-trivial design decision. Full detail with MTA source quotes in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+1. **No modification of original game files.** Runtime hooks/patches
+   only. `Wilbur.exe`, `.sx`, `.dbl`, assets untouched on disk.
+2. **Engine-extension paradigm.** mtr-asi is an engine on top of MTR's
+   engine, not "a few hooks". Modules own lifecycles; clean APIs.
+3. **Parallel class hierarchy mirroring engine structures.** For coop:
+   `MtrRemotePlayer` (ours, owns network/interp/input) + orphan entity
+   (engine class, owns rendering/animation), connected by pointer. MTA
+   shape: `CClientPed::m_pPlayerPed → CPlayerPed*` (CClientPlayer subclasses
+   CClientPed for remote-player flavour).
+4. **Targeted crash fixes, not broad suppression.** Each NULL-deref or
+   single-player-assumption gets its own targeted patch/init/route at
+   that specific call site. NEVER a broader "unlink all" mechanism.
+5. **Minimum viable subset.** Coop scope is "two players walk + interact
+   through existing levels". See [docs/COOP_SCOPE.md](docs/COOP_SCOPE.md).
+6. **Augment SP, never replace it.** Where coop meets SP, prefer
+   per-player routing inside SP over bypassing SP. Players hit SP first.
+7. **Engine-wrapper layer ≠ gameplay/network layer.** MTA splits engine
+   wrappers (`Client/game_sa/`) from gameplay/network logic
+   (`Client/mods/deathmatch/logic/`). Mirror this discipline in our
+   `src/coop/` subtree — files don't mix engine VA dereferences with
+   network state.
+
+Plus two top-level rules in [CLAUDE.md](CLAUDE.md):
+- **RULE №1 — no crutches**: always pick the proper root-cause fix,
+  weeks or months OK if it's proper.
+- **RULE №2 — no migration baggage**: when something is replaced, the
+  old code goes fully and immediately. No legacy fallbacks, no
+  compatibility flags, no parallel old + new paths.
+
+---
+
+## Recent work (2026-05-07 → 2026-05-10)
+
+The original status table below reflects state as of 2026-05-04. The mod has grown substantially since. Highlights of work shipped in the last week:
+
+- **DXVK migration** (replaces dxwrapper). Wilbur's D3D9 calls now route through DXVK to native Vulkan. Hardware MSAA via [src/mtr-asi/src/msaa.cpp](src/mtr-asi/src/msaa.cpp) (default 16x with cap-check fallback). Native borderless-fullscreen via [windowmode.cpp](src/mtr-asi/src/windowmode.cpp). Tuned DXVK config in `Game/dxvk.conf` (`samplerAnisotropy=16`, `forceMipmapLodBias=-0.5`, `invariantPosition=True`, `cachedDynamicBuffers=True`).
+- **Sim/render decoupling complete** (M0–M6 plan). Camera view-matrix interpolation, player+NPC transform interp with save/write/restore fence, halo follow-fix, exhaustive 0.003-dt audit. The game runs smoothly at 240Hz. ([research/findings/decouple-m5-m6-plan-complete-2026-05-07.md](research/findings/decouple-m5-m6-plan-complete-2026-05-07.md))
+- **Per-element UI control**. Composite-key matcher pinning by `state_key + uv_bucket + screen_context + bbox_quadrant + sort_key + widget_name_hash`. Click-to-pick, gizmo overlay, ini persistence, auto-grouping. Cross-screen Specialize fix dropped `screen_context` from pinning so the same texture role matches across screens. ([research/findings/sprite-per-element-architecture.md](research/findings/sprite-per-element-architecture.md))
+- **World-space debug overlays** (NEW). 3D-projected via the engine's view+proj matrices, drawn through ImGui's foreground draw list:
+  - **Trigger-box overlay** ([trigger_overlay.cpp](src/mtr-asi/src/trigger_overlay.cpp)) — wireframe AABBs with homogeneous parametric clip in clip space.
+  - **NPC overlay Phase 1** ([npc_overlay.cpp](src/mtr-asi/src/npc_overlay.cpp)) — walks `dword_724DE4` transform list, reads entity name + pos, draws labels at projected screen coords. Shared math: [include/mtr/overlay_math.h](src/mtr-asi/include/mtr/overlay_math.h).
+- **Autonomous validation pipeline** (NEW). The mod can launch the game itself, drive engine state via DI keypress injection, exercise a feature, write structured per-frame log lines, and shut down. An offline PowerShell validator re-runs the projection math and asserts correctness within a fixed pixel tolerance. Crash-handler integration writes a result-JSON sentinel + minidump on SEH so engine crashes surface as clear failures rather than launch failures. Usage: `pwsh tools/run-test.ps1 -Scenario <name> -Redeploy`. Detail: [docs/AUTONOMOUS_TESTING.md](docs/AUTONOMOUS_TESTING.md).
+- **Crash handler** ([crash_handler.cpp](src/mtr-asi/src/crash_handler.cpp)) — `SetUnhandledExceptionFilter` installed in DllMain, writes minidump (`Game/mtr-asi-crash-*.dmp`) + `[CRASH]` log line + scenario result-JSON sentinel for any unhandled SEH.
+- **Freecam smoothness fix**. Replaced `GetTickCount64` (15.625 ms resolution = choppy at 240 Hz) with `QueryPerformanceCounter` for sub-frame-accurate dt.
+
+Full per-shipment notes: [research/findings/](research/findings/) (sorted by date suffix).
+
+---
+
 ## Status (2026-05-04)
 
 | Component | State |
@@ -31,11 +89,13 @@ Full living list: [research/findings/known-issues.md](research/findings/known-is
 
 ---
 
-## Architecture in one paragraph
+## Architecture in one paragraph (current, 2026-05-10)
 
-Wilbur.exe (D3D8 game) imports `d3d8.dll`. Our `Game/` directory has a hijacked `d3d8.dll` (`dxwrapper`) that translates D3D8 → D3D9. dxwrapper also acts as the .asi loader and pulls in `mtr-asi.asi`. Our mod hooks `GetCommandLineA/W` synchronously in `DllMain` (rewrite resolution before CRT reads it), then in a deferred thread hooks D3D9 vtables (`IDirect3D9::CreateDevice` for diagnostics, `IDirect3DDevice9::EndScene/Reset` for ImGui menu) and two game-side functions in Wilbur.exe at fixed VAs (`0x00562B20` for projection-matrix construction, `0x00564600` for cache invalidation — these own the live aspect-ratio override). Both proxies (dxwrapper's d3d8 stub and our mod) coexist because dxwrapper does the translation and we hook D3D9 downstream of it.
+Wilbur.exe is a 2007 D3D8 game. We route the rendering through DXVK's `d3d8.dll → d3d9.dll → Vulkan` pipeline (vendored in `Game/` from a built DXVK binary; configured via `Game/dxvk.conf`). The mod is loaded as `mtr-asi.asi` via Ultimate ASI Loader (`Game/dinput8.dll`). In `DllMain` it installs the crash handler, the cmdline rewriter, the cvar registration logger, and an early hook on `Direct3DCreate9` so when the engine's `WinMain` reaches D3D init the CreateDevice vtable is already hooked (required for cold-launch overrides like MSAA / windowmode to apply). After `DllMain` returns, a worker thread installs the rest: ~30 modules covering camera/projection/sprite-batcher hooks, ImGui menu, sim/render decouple, world-space debug overlays (trigger boxes + NPC labels), per-element UI control, and an autonomous test harness.
 
-Detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [research/findings/dxwrapper-integration.md](research/findings/dxwrapper-integration.md).
+The runtime overlay layer (ImGui menu + per-frame foreground-draw-list overlays) sits at `EndScene` after the engine has rendered the 3D scene; the menu, FPS overlay, trigger boxes, and NPC labels all share the same `ImGui::NewFrame` → `Render` lifecycle. Engine matrix globals are read at fixed VAs (`view@0x00724C10`, `world@0x00724C50`, `proj@0x00745AA0`) and are SEH-guarded.
+
+Detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/AUTONOMOUS_TESTING.md](docs/AUTONOMOUS_TESTING.md). Migration history: [research/findings/dxvk-migration-plan-2026-05-08.md](research/findings/dxvk-migration-plan-2026-05-08.md). Original dxwrapper integration is retired but the doc is kept for context: [research/findings/dxwrapper-integration.md](research/findings/dxwrapper-integration.md).
 
 ---
 

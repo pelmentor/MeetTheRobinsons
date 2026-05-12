@@ -3,6 +3,20 @@
 How entities (objects, characters, NPCs, pickups, projectiles) are
 defined, instantiated, ticked, and connected to AI scripts and animations.
 
+> **2026-05-10 CORRECTION (Phase 0A RE):** The factory claim in this doc was wrong.
+> `sub_5B40C0` ("script_command_dispatch_giant") is the **scripted-trigger / cutscene
+> command dispatcher** (keyed on `commandType` against `actorActivate`,
+> `addInventory`, `changeMusic`, `fadeIn`, `flicker`, `checkpointStart`, …) —
+> **NOT** the entity factory. The IDB name was correct.
+>
+> The real entity factory is **`entity_factory_construct` at `0x5B96F0`**
+> (~310 bytes, fully decompilable). Class registry head is **`g_class_registry_head`
+> at `0x7429C8`** with 17 classes registered (`protagonist`, `actor`, `compActor`,
+> `plant`, `triggerbox`, `playerActor`, `ColorGun`, `testPlayer`, `miniHamsterPlayer`,
+> 6 DigDug variants, `wilbur`, `wilburDigDug`, `digdug`). The "50+ classes" claim
+> below was wrong — there are 17. Full writeup:
+> [coop-phase-0a-entity-factory-2026-05-10.md](coop-phase-0a-entity-factory-2026-05-10.md).
+
 ## TL;DR
 
 1. **Pure data-driven.** Entities are described by **string KV bags** like

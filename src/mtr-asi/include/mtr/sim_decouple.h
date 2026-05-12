@@ -85,6 +85,14 @@ double measured_alpha();
 void on_render_frame();
 void on_sim_tick();
 
+// True iff sim_aggregator's orig actually ran during the current render
+// frame (not yet cleared by on_render_frame in EndScene). Used by the
+// dt_correctness::TimeScale::VisualLockToSim path so visual systems can
+// gate their per-frame advance on sim-tick boundaries instead of render
+// rate. False between sim ticks; flips true momentarily when sim fires
+// then back to false at end of render frame.
+bool sim_ticked_this_render_frame();
+
 // Diagnostics ----------------------------------------------------------------
 // Cumulative skip counters since install. At 240 Hz render with throttle@60,
 // expect roughly 3 skips per non-skipped tick (~75% skip ratio).

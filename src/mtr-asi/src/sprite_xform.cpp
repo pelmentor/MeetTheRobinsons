@@ -63,6 +63,19 @@ namespace mtr::state_key_probe {
     size_t read_state_key_path(uint32_t state_key, char* out, size_t out_size);
 }
 
+// Phase 2 — engine-level widget identity (2026-05-09). When a sprite is
+// submitted via sub_4E9350 from a widget Render method, widget_probe
+// captures the widget's m_pcName (string at this+0x130) and stashes it
+// in a per-frame side-table keyed by the SpriteEntry pointer. We use
+// it as the most-specific component of CompositeKey when available —
+// stable across heap-pointer churn (re-entries, sessions) for widgets
+// whose Render path goes through one of the captured callers.
+// `widget_name_for_entry` returns nullptr when no name was captured for
+// this entry (most callers + all sprites without a widget context).
+namespace mtr::widget_probe {
+    const char* widget_name_for_entry(void* entry_ptr);
+}
+
 // Quad capture for click-picking + gizmo overlay. process_list submits
 // each entry's final post-transform 4-corner quad along with the slot
 // it resolved to, so the menu can hit-test cursor positions and draw
@@ -112,19 +125,48 @@ constexpr size_t kGroupLen = 32;
 constexpr uint16_t kUVWildcard      = 0xFFFF;
 constexpr uint8_t  kScreenWildcard  = 0xFF;
 constexpr uint8_t  kQuadWildcard    = 0xFF;  // concrete quadrant is 0..8
+constexpr uint16_t kSortKeyWildcard = 0xFFFF;
 
 struct CompositeKey {
-    uint32_t state_key      = 0;
-    uint16_t uv_bucket      = kUVWildcard;
-    uint8_t  screen_context = kScreenWildcard;
-    uint8_t  bbox_quadrant  = kQuadWildcard;
+    uint32_t state_key        = 0;
+    uint16_t uv_bucket        = kUVWildcard;
+    uint8_t  screen_context   = kScreenWildcard;
+    uint8_t  bbox_quadrant    = kQuadWildcard;
+    // 2026-05-09 — engine sprite-batcher sort_key (entry +0x16, uint16).
+    // Distinguishes widgets that share state_key + texture but render at
+    // different z-order tiers. Concrete example: GameSelectScreen has
+    // IDS_TOP/IDS_BOTTOM gradients at sort=301 and IDS_HIGHLIGHT_BACKGROUND
+    // at sort=402, all sharing state_key=0x0FA091B0. Without this field,
+    // a slot matching the static gradient also matched the moving highlight.
+    uint16_t sort_key         = kSortKeyWildcard;
+    // Phase 2 (2026-05-09): engine-level widget identity. When non-zero,
+    // this slot's pattern only matches sprites whose widget Render
+    // captured the same widget name (FNV-1a hash). 0 = wildcard
+    // (= legacy v2 behaviour, matches anything).
+    uint32_t widget_name_hash = 0;
 
     bool is_wildcard_pattern() const {
-        return uv_bucket      == kUVWildcard
-            && screen_context == kScreenWildcard
-            && bbox_quadrant  == kQuadWildcard;
+        return uv_bucket        == kUVWildcard
+            && screen_context   == kScreenWildcard
+            && bbox_quadrant    == kQuadWildcard
+            && sort_key         == kSortKeyWildcard
+            && widget_name_hash == 0;
     }
 };
+
+// FNV-1a 32-bit hash for widget identifier strings. Empty/null -> 0
+// (treated as wildcard by the matcher).
+uint32_t hash_widget_name(const char* s) {
+    if (!s || !*s) return 0;
+    uint32_t h = 0x811C9DC5u;
+    for (; *s; ++s) {
+        h ^= static_cast<uint32_t>(static_cast<uint8_t>(*s));
+        h *= 0x01000193u;
+    }
+    // Reserve 0 as the wildcard sentinel — collisions to 0 are
+    // astronomically unlikely but we defensively bump them.
+    return h ? h : 1u;
+}
 
 // Per-slot identity: the slot's stored *pattern* (which may have wildcards)
 // plus the most-recent *concrete* key that matched it. The concrete key is
@@ -167,6 +209,14 @@ struct Slot {
     bool auto_named          = false;
     bool auto_name_attempted = false;
 
+    // Auto-grouping bookkeeping (2026-05-09 fix for "list never updates
+    // with new entries"): true when `group` was populated by the
+    // auto-group-from-path machinery, false when the user typed it
+    // manually. Auto-derived groups must NOT pin the slot for eviction —
+    // otherwise the slot table fills up under Auto-group ON and new
+    // widgets stop getting allocated.
+    bool auto_grouped        = false;
+
     // Phase D.5 — auto-derived asset path. Populated alongside `name` on
     // first auto-name read, but NEVER overwritten by user edits to the
     // name field (so even if the user types "wilbur smile" we still know
@@ -175,6 +225,14 @@ struct Slot {
     // (state_keys are heap pointers that shift across sessions; paths are
     // engine-level identifiers that stay stable).
     char path[kNameLen] = {0};
+
+    // Phase 2 (2026-05-09): engine-level widget identity, populated when
+    // a SubmitSprite caller's widget object exposed an m_pcName at the
+    // confirmed +0x130 offset. Persists across sessions because it's an
+    // engine-defined string (e.g. "Btn_Legend_Accept", "FrontEnd_Load")
+    // baked into .sc data, NOT a heap pointer. Empty when not available
+    // (most callers + sprites without a widget context).
+    char widget_name[kNameLen] = {0};
 };
 
 bool key_matches_pattern(const CompositeKey& pattern, const CompositeKey& concrete) {
@@ -182,18 +240,34 @@ bool key_matches_pattern(const CompositeKey& pattern, const CompositeKey& concre
     if (pattern.uv_bucket      != kUVWildcard     && pattern.uv_bucket      != concrete.uv_bucket)      return false;
     if (pattern.screen_context != kScreenWildcard && pattern.screen_context != concrete.screen_context) return false;
     if (pattern.bbox_quadrant  != kQuadWildcard   && pattern.bbox_quadrant  != concrete.bbox_quadrant)  return false;
+    if (pattern.sort_key       != kSortKeyWildcard && pattern.sort_key      != concrete.sort_key)       return false;
+    if (pattern.widget_name_hash != 0 && pattern.widget_name_hash != concrete.widget_name_hash) return false;
     return true;
 }
 
 int key_specificity(const CompositeKey& pattern) {
     int s = 1;  // state_key always counts
-    if (pattern.uv_bucket      != kUVWildcard)     ++s;
-    if (pattern.screen_context != kScreenWildcard) ++s;
-    if (pattern.bbox_quadrant  != kQuadWildcard)   ++s;
+    if (pattern.uv_bucket        != kUVWildcard)      ++s;
+    if (pattern.screen_context   != kScreenWildcard)  ++s;
+    if (pattern.bbox_quadrant    != kQuadWildcard)    ++s;
+    // sort_key is the engine sprite-batcher z-order tier — weight it +2
+    // so a sort_key match beats a same-state_key bbox/uv tie. Concrete
+    // case driving this: IDS_TOP/BOTTOM share state_key with HIGHLIGHT
+    // but differ in sort_key.
+    if (pattern.sort_key         != kSortKeyWildcard) s += 2;
+    // widget_name is engine-level identity — weight it heavier than the
+    // heuristic fields so a widget-name match wins ties against
+    // bbox/uv/screen specializations.
+    if (pattern.widget_name_hash != 0)                s += 2;
     return s;
 }
 
-std::atomic<bool>     g_enabled{false};
+// 2026-05-09 user request: per-element UI control defaults ON. Without
+// this enable bit, the per-element transforms (offsets/scales/hides) the
+// user has dialed in stay loaded but never apply, which made saved
+// settings appear to do nothing on first launch. Default ON makes the
+// shipped UI tweaks take effect immediately.
+std::atomic<bool>     g_enabled{true};
 std::atomic<uint64_t> g_frame_no{0};
 std::atomic<uint64_t> g_last_total_entries{0};
 std::atomic<uint64_t> g_edit_seq{1};
@@ -232,8 +306,24 @@ struct PendingByPath {
     uint16_t uv_bucket      = 0xFFFF;
     uint8_t  screen_context = 0xFF;
     uint8_t  bbox_quadrant  = 0xFF;
+    uint16_t sort_key       = 0xFFFF;
 };
 std::vector<PendingByPath> g_pending_by_path;
+
+// Phase 3 (2026-05-09): pending-by-widget-name queue. Same idea as
+// PendingByPath but keyed by the engine-level widget name string
+// captured by widget_probe. Preferred over path matching when a slot
+// has both a path AND a widget_name — widget_name is more specific
+// (e.g. distinguishes IDS_TOP from IDS_BOTTOM despite same texture).
+struct PendingByWidgetName {
+    char     widget_name[kNameLen] = {0};
+    char     name[kNameLen]        = {0};
+    char     group[kGroupLen]      = {0};
+    float    offset_x = 0.0f, offset_y = 0.0f;
+    float    scale_x  = 1.0f, scale_y  = 1.0f;
+    bool     hidden   = false;
+};
+std::vector<PendingByWidgetName> g_pending_by_widget_name;
 
 // Highlight overlay state: cleared at the top of every process_list, then
 // each highlighted slot's matching entries have their post-transform
@@ -385,6 +475,13 @@ CompositeKey concrete_key_for(const SpriteEntry* e, uint8_t frame_screen_ctx) {
     k.uv_bucket      = compute_uv_bucket(e->inline_uvs);
     k.screen_context = frame_screen_ctx;
     k.bbox_quadrant  = compute_bbox_quadrant(e->inline_positions);
+    k.sort_key       = e->sort_key;
+    // Phase 2: engine-level widget identity from widget_probe's per-frame
+    // side-table. Most entries return nullptr (no widget context); for
+    // those, hash stays 0 = wildcard.
+    const char* wname = mtr::widget_probe::widget_name_for_entry(
+        const_cast<SpriteEntry*>(e));
+    k.widget_name_hash = hash_widget_name(wname);
     return k;
 }
 
@@ -449,9 +546,20 @@ int alloc_slot() {
         // reset to defaults — without it, "user reset offset to 0"
         // would fail has_user_state and the slot would silently evict,
         // erasing the value the user just typed.
+        //
+        // 2026-05-09: previously checked `name[0] != 0` and `group[0] != 0`
+        // unconditionally, which pinned every slot that had auto-derived
+        // metadata from the texture loader / Auto-group toggle. Under
+        // Auto-group ON the table filled to kMaxKeys=64, no slot was
+        // evictable, alloc_slot returned -1, and new state_keys couldn't
+        // be allocated — the per-element list looked frozen. Now only
+        // MANUALLY-set name and group pin the slot; auto-derived values
+        // don't.
+        const bool has_user_name  = s.name[0]  != 0 && !s.auto_named;
+        const bool has_user_group = s.group[0] != 0 && !s.auto_grouped;
         const bool has_user_state =
             s.edit_seq > 0 ||
-            s.name[0] != 0 || s.group[0] != 0 ||
+            has_user_name || has_user_group ||
             s.offset_x != 0.0f || s.offset_y != 0.0f ||
             s.scale_x != 1.0f || s.scale_y != 1.0f ||
             s.hidden ||
@@ -483,7 +591,16 @@ int find_or_create_wildcard(uint32_t state_key) {
     s.key.uv_bucket      = kUVWildcard;
     s.key.screen_context = kScreenWildcard;
     s.key.bbox_quadrant  = kQuadWildcard;
+    s.key.sort_key       = kSortKeyWildcard;
     index_add(state_key, idx);
+    // Pre-Phase-1 persistence diagnostic (2026-05-09): log every brand-new
+    // state_key arrival so we can correlate it with screen-push events and
+    // know whether the engine is reallocating texture handles on screen
+    // reload (the symptom: specialized slots dying because their pinned
+    // state_key is now gone).
+    mtr::log::info("[diag] new state_key=0x%08X slot=%d (frame=%llu)",
+                   state_key, idx,
+                   (unsigned long long)g_frame_no.load(std::memory_order_relaxed));
     return idx;
 }
 
@@ -689,6 +806,15 @@ void process_list() {
     uint64_t total = 0;
     {
         std::scoped_lock lk(g_mu);
+        // (NOTE 2026-05-09 — the previous "path-based slot rebind" block
+        //  here was reverted: it migrated specialized slots to whatever
+        //  random sprite on a different screen happened to share their
+        //  texture path (e.g. whitesprite.tga, used on every screen).
+        //  Coming back to the original screen then found no slot for the
+        //  original state_key and auto-spawned a new wildcard, defeating
+        //  the user's specialization. State_key is stable within a session
+        //  while the texture stays loaded, so plain matching is correct.)
+
         for (SpriteEntry* e = head; e; e = e->next) {
             ++total;
             if (e->state_key == 0) continue;
@@ -712,6 +838,52 @@ void process_list() {
             s.last_seen_frame = fno;
             s.last_concrete = concrete;
             s.last_concrete_valid = true;
+
+            // Phase 2: capture the widget_name string into the slot when
+            // available + not yet stored. The hash is already in
+            // `concrete.widget_name_hash`, but we want the readable string
+            // for the UI tree label and for ini persistence keys.
+            if (concrete.widget_name_hash != 0 && s.widget_name[0] == 0) {
+                const char* wname = mtr::widget_probe::widget_name_for_entry(e);
+                if (wname && wname[0]) {
+                    std::strncpy(s.widget_name, wname, kNameLen - 1);
+                    s.widget_name[kNameLen - 1] = 0;
+                }
+            }
+
+            // Phase 3: resolve pending-by-widget-name. Runs every frame
+            // (NOT gated on auto_name_attempted) because a slot may be
+            // created before widget_probe captures its widget_name —
+            // we want to apply pending state the moment the name first
+            // appears. The pending list erases on match, so subsequent
+            // frames are no-ops once consumed.
+            if (s.widget_name[0] && !g_pending_by_widget_name.empty()) {
+                for (auto it = g_pending_by_widget_name.begin();
+                     it != g_pending_by_widget_name.end(); ) {
+                    if (std::strcmp(it->widget_name, s.widget_name) == 0) {
+                        s.offset_x = it->offset_x;
+                        s.offset_y = it->offset_y;
+                        s.scale_x  = it->scale_x;
+                        s.scale_y  = it->scale_y;
+                        s.hidden   = it->hidden;
+                        if (it->name[0]) {
+                            std::strncpy(s.name, it->name, kNameLen - 1);
+                            s.name[kNameLen - 1] = 0;
+                            s.auto_named = false;
+                        }
+                        std::strncpy(s.group, it->group, kGroupLen - 1);
+                        s.group[kGroupLen - 1] = 0;
+                        // Promote the slot's pattern to require widget_name
+                        // match — disambiguates atlas-sharing widgets
+                        // (IDS_TOP vs IDS_BOTTOM with the same texture).
+                        s.key.widget_name_hash = hash_widget_name(it->widget_name);
+                        s.edit_seq = g_edit_seq.fetch_add(1);
+                        it = g_pending_by_widget_name.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
 
             // Auto-name (Phase D.4) + by-path persistence (Phase D.5): on
             // first sight of a slot, try reading the asset path from the
@@ -746,10 +918,11 @@ void process_list() {
                         if (dg[0]) {
                             std::memcpy(s.group, dg, kGroupLen);
                             s.group[kGroupLen - 1] = 0;
+                            s.auto_grouped = true;
                         }
                     }
 
-                    // Resolve pending-by-path matches.
+                    // Resolve pending-by-path matches (legacy/fallback path).
                     for (auto it = g_pending_by_path.begin(); it != g_pending_by_path.end(); ) {
                         if (std::strcmp(it->path, s.path) == 0) {
                             // Pattern: when pending entry has non-wildcard
@@ -761,11 +934,13 @@ void process_list() {
                             const bool any_concrete =
                                 it->uv_bucket      != 0xFFFF
                              || it->screen_context != 0xFF
-                             || it->bbox_quadrant  != 0xFF;
+                             || it->bbox_quadrant  != 0xFF
+                             || it->sort_key       != 0xFFFF;
                             if (any_concrete) {
                                 s.key.uv_bucket      = it->uv_bucket;
                                 s.key.screen_context = it->screen_context;
                                 s.key.bbox_quadrant  = it->bbox_quadrant;
+                                s.key.sort_key       = it->sort_key;
                             }
                             s.offset_x = it->offset_x;
                             s.offset_y = it->offset_y;
@@ -925,10 +1100,16 @@ int snapshot_slots(SlotInfo* out, int max_out) {
     for (int i = 0; i < kMaxKeys; ++i) {
         if (copy[i].key.state_key != 0) idx[n++] = i;
     }
-    // Sort by frame_count desc (matches v1 ordering).
+    // Stable order: sort by slot_idx (creation order). Previously sorted by
+    // frame_count desc which gave activity-based discovery but reshuffled
+    // every frame as counts change — caused the per-element list in the
+    // menu to jump under the user's cursor and reset ImGui state on every
+    // edit. slot_idx ascending is monotonic across the slot's lifetime so
+    // a row never moves until its slot is freed. Newly created slots
+    // (Specialize) land predictably at the end.
     for (int i = 1; i < n; ++i) {
         int j = i;
-        while (j > 0 && copy[idx[j]].frame_count > copy[idx[j-1]].frame_count) {
+        while (j > 0 && idx[j] < idx[j-1]) {
             int t = idx[j]; idx[j] = idx[j-1]; idx[j-1] = t;
             --j;
         }
@@ -1106,7 +1287,11 @@ int auto_group_all_from_paths() {
         if (!dg[0]) continue;
         std::memcpy(s.group, dg, kGroupLen);
         s.group[kGroupLen - 1] = 0;
-        s.edit_seq = g_edit_seq.fetch_add(1);
+        s.auto_grouped = true;
+        // Don't bump edit_seq — auto-grouping is derived metadata, not a
+        // user edit. Bumping edit_seq would have pinned the slot under
+        // the prior eviction policy; with auto_grouped honored the slot
+        // stays evictable until the user manually edits it.
         ++n;
     }
     return n;
@@ -1206,6 +1391,7 @@ void add_pending_by_path(const char* path,
                          uint16_t uv_bucket,
                          uint8_t  screen_context,
                          uint8_t  bbox_quadrant,
+                         uint16_t sort_key,
                          float ox, float oy,
                          float sx, float sy, bool hidden,
                          const char* name, const char* group) {
@@ -1222,6 +1408,7 @@ void add_pending_by_path(const char* path,
     p.uv_bucket      = uv_bucket;
     p.screen_context = screen_context;
     p.bbox_quadrant  = bbox_quadrant;
+    p.sort_key       = sort_key;
     std::scoped_lock lk(g_mu);
     g_pending_by_path.push_back(p);
 }
@@ -1310,6 +1497,7 @@ void set_group_at(int slot_idx, const char* group) {
     Slot& s = g_slots[slot_idx];
     std::strncpy(s.group, group ? group : "", kGroupLen - 1);
     s.group[kGroupLen - 1] = 0;
+    s.auto_grouped = false;  // user typed = manual; pin against eviction
     s.edit_seq = g_edit_seq.fetch_add(1);
 }
 
@@ -1336,7 +1524,8 @@ int specialize_slot(int parent_slot_idx) {
             if (s.key.state_key      == parent.last_concrete.state_key
              && s.key.uv_bucket      == parent.last_concrete.uv_bucket
              && s.key.screen_context == parent.last_concrete.screen_context
-             && s.key.bbox_quadrant  == parent.last_concrete.bbox_quadrant) {
+             && s.key.bbox_quadrant  == parent.last_concrete.bbox_quadrant
+             && s.key.sort_key       == parent.last_concrete.sort_key) {
                 return idx;
             }
         }
@@ -1346,6 +1535,21 @@ int specialize_slot(int parent_slot_idx) {
     if (idx < 0) return -1;
     Slot& s = g_slots[idx];
     s.key      = parent.last_concrete;
+    // Cross-screen Specialize (2026-05-09): screen_context pinning was
+    // the symptom of "specialized identity doesn't keep" — same widget
+    // on different screens has different sc, so a sc-pinned slot only
+    // worked on its origin screen. The remaining geometric fields
+    // (uv_bucket + bbox_quadrant + sort_key) already identify the
+    // texture role (which UV region, which quadrant, which z-tier);
+    // dropping sc lets the same role match across screens, which is the
+    // user-intended behavior. When widget_name_hash is also non-zero,
+    // drop the geometric fields too — engine name is authoritative.
+    s.key.screen_context = kScreenWildcard;
+    if (s.key.widget_name_hash != 0) {
+        s.key.uv_bucket      = kUVWildcard;
+        s.key.bbox_quadrant  = kQuadWildcard;
+        s.key.sort_key       = kSortKeyWildcard;
+    }
     s.last_concrete       = parent.last_concrete;
     s.last_concrete_valid = true;
     s.offset_x = parent.offset_x;
@@ -1357,6 +1561,19 @@ int specialize_slot(int parent_slot_idx) {
     std::memcpy(s.group, parent.group, kGroupLen);
     s.edit_seq = g_edit_seq.fetch_add(1);
     index_add(s.key.state_key, idx);
+    // Pre-Phase-1 persistence diagnostic (2026-05-09): full key dump on
+    // every Specialize so we can correlate the slot's pinned components
+    // with what process_list sees after a screen reload.
+    mtr::log::info("[diag] specialize: parent=%d new=%d "
+                   "key={state=0x%08X uv=0x%04X sc=0x%02X q=0x%02X sort=0x%04X} "
+                   "name=\"%s\" group=\"%s\" frame=%llu",
+                   parent_slot_idx, idx,
+                   s.key.state_key, s.key.uv_bucket,
+                   (unsigned)s.key.screen_context,
+                   (unsigned)s.key.bbox_quadrant,
+                   s.key.sort_key,
+                   s.name, s.group,
+                   (unsigned long long)g_frame_no.load(std::memory_order_relaxed));
     return idx;
 }
 
@@ -1409,12 +1626,14 @@ bool save_at_full(int i, uint32_t* out_state_key,
                   uint16_t* out_uv_bucket,
                   uint8_t*  out_screen_context,
                   uint8_t*  out_bbox_quadrant,
+                  uint16_t* out_sort_key,
                   float* out_ox, float* out_oy,
                   float* out_sx, float* out_sy,
                   bool* out_hidden,
                   char* out_name,  size_t out_name_sz,
                   char* out_group, size_t out_group_sz,
-                  char* out_path,  size_t out_path_sz) {
+                  char* out_path,  size_t out_path_sz,
+                  char* out_widget_name, size_t out_widget_name_sz) {
     std::scoped_lock lk(g_mu);
     int n = 0;
     for (auto& s : g_slots) {
@@ -1424,6 +1643,7 @@ bool save_at_full(int i, uint32_t* out_state_key,
             if (out_uv_bucket)      *out_uv_bucket      = s.key.uv_bucket;
             if (out_screen_context) *out_screen_context = s.key.screen_context;
             if (out_bbox_quadrant)  *out_bbox_quadrant  = s.key.bbox_quadrant;
+            if (out_sort_key)       *out_sort_key       = s.key.sort_key;
             if (out_ox) *out_ox = s.offset_x;
             if (out_oy) *out_oy = s.offset_y;
             if (out_sx) *out_sx = s.scale_x;
@@ -1450,6 +1670,10 @@ bool save_at_full(int i, uint32_t* out_state_key,
                 std::strncpy(out_path, s.path, out_path_sz - 1);
                 out_path[out_path_sz - 1] = 0;
             }
+            if (out_widget_name && out_widget_name_sz > 0) {
+                std::strncpy(out_widget_name, s.widget_name, out_widget_name_sz - 1);
+                out_widget_name[out_widget_name_sz - 1] = 0;
+            }
             return true;
         }
         ++n;
@@ -1467,11 +1691,37 @@ bool save_at(int i, uint32_t* out_state_key,
              char* out_name,  size_t out_name_sz,
              char* out_group, size_t out_group_sz) {
     return save_at_full(i, out_state_key,
-                        nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr,
                         out_ox, out_oy, out_sx, out_sy,
                         out_hidden, out_name, out_name_sz,
                         out_group, out_group_sz,
+                        nullptr, 0,
                         nullptr, 0);
+}
+
+// Phase 3: queue an entry for cross-session restoration keyed by engine-
+// level widget name. Called from ui_aspect_rules ini load when a slot
+// has a non-empty widget_name field. When process_list later sees a
+// SubmitSprite caller whose widget_probe-captured name matches, this
+// queue entry's state is applied and the entry is dropped. More robust
+// than path-based matching for atlas-sharing widgets (IDS_TOP and
+// IDS_BOTTOM share GlowBox_Line.dbl but have distinct widget_names).
+void add_pending_by_widget_name(const char* widget_name,
+                                float ox, float oy,
+                                float sx, float sy, bool hidden,
+                                const char* name, const char* group) {
+    if (!widget_name || !widget_name[0]) return;
+    PendingByWidgetName p{};
+    std::strncpy(p.widget_name, widget_name, kNameLen - 1);
+    if (name)  std::strncpy(p.name,  name,  kNameLen - 1);
+    if (group) std::strncpy(p.group, group, kGroupLen - 1);
+    p.offset_x = ox;
+    p.offset_y = oy;
+    p.scale_x  = sx;
+    p.scale_y  = sy;
+    p.hidden   = hidden;
+    std::scoped_lock lk(g_mu);
+    g_pending_by_widget_name.push_back(p);
 }
 
 // Extended load: takes the composite-key components. Callers passing
@@ -1482,6 +1732,7 @@ void load_apply_full(uint32_t state_key,
                      uint16_t uv_bucket,
                      uint8_t  screen_context,
                      uint8_t  bbox_quadrant,
+                     uint16_t sort_key,
                      float ox, float oy,
                      float sx, float sy, bool hidden,
                      const char* name, const char* group) {
@@ -1495,7 +1746,8 @@ void load_apply_full(uint32_t state_key,
     const bool is_wildcard =
         uv_bucket      == kUVWildcard
      && screen_context == kScreenWildcard
-     && bbox_quadrant  == kQuadWildcard;
+     && bbox_quadrant  == kQuadWildcard
+     && sort_key       == kSortKeyWildcard;
     if (is_wildcard) {
         idx = find_or_create_wildcard(state_key);
     } else {
@@ -1506,6 +1758,7 @@ void load_apply_full(uint32_t state_key,
             s.key.uv_bucket      = uv_bucket;
             s.key.screen_context = screen_context;
             s.key.bbox_quadrant  = bbox_quadrant;
+            s.key.sort_key       = sort_key;
             index_add(state_key, idx);
         }
     }
@@ -1531,6 +1784,7 @@ void load_apply(uint32_t state_key, float ox, float oy,
                 float sx, float sy, bool hidden,
                 const char* name, const char* group) {
     load_apply_full(state_key, kUVWildcard, kScreenWildcard, kQuadWildcard,
+                    kSortKeyWildcard,
                     ox, oy, sx, sy, hidden, name, group);
 }
 

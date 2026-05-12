@@ -27,6 +27,12 @@ ida/dumps/
 tools/x64dbg_snapshot*/
 __pycache__/
 
+# Autonomous test run artifacts (JSON reports, screenshots — regenerable, gigabytes)
+tools/test-runs/
+
+# DXVK build outputs (regenerable from third_party/dxvk submodule + tools/build-dxvk.sh)
+third_party/dxvk-build/
+
 # ===== Build output =====
 build/
 out/
@@ -76,8 +82,8 @@ desktop.ini
 *.swp
 *~
 
-# ===== Claude Code local settings (machine-specific) =====
-.claude/settings.local.json
+# ===== Claude Code local settings (machine-specific MCP paths etc.) =====
+.claude/
 
 # ===== Allow-list (override the broad *.exe / *.dll bans for our own outputs) =====
 !src/**/*.dll

@@ -48,12 +48,18 @@ namespace mtr::sprite_xform {
                       uint16_t* out_uv_bucket,
                       uint8_t*  out_screen_context,
                       uint8_t*  out_bbox_quadrant,
+                      uint16_t* out_sort_key,
                       float* out_ox, float* out_oy,
                       float* out_sx, float* out_sy,
                       bool* out_hidden,
                       char* out_name,  size_t out_name_sz,
                       char* out_group, size_t out_group_sz,
-                      char* out_path,  size_t out_path_sz);
+                      char* out_path,  size_t out_path_sz,
+                      char* out_widget_name, size_t out_widget_name_sz);
+    void add_pending_by_widget_name(const char* widget_name,
+                                    float ox, float oy,
+                                    float sx, float sy, bool hidden,
+                                    const char* name, const char* group);
     void load_apply(uint32_t state_key, float ox, float oy,
                     float sx, float sy, bool hidden,
                     const char* name, const char* group);
@@ -61,6 +67,7 @@ namespace mtr::sprite_xform {
                          uint16_t uv_bucket,
                          uint8_t  screen_context,
                          uint8_t  bbox_quadrant,
+                         uint16_t sort_key,
                          float ox, float oy,
                          float sx, float sy, bool hidden,
                          const char* name, const char* group);
@@ -68,6 +75,7 @@ namespace mtr::sprite_xform {
                              uint16_t uv_bucket,
                              uint8_t  screen_context,
                              uint8_t  bbox_quadrant,
+                             uint16_t sort_key,
                              float ox, float oy,
                              float sx, float sy, bool hidden,
                              const char* name, const char* group);
@@ -82,10 +90,11 @@ void flush_pending_save();
 
 namespace {
 
-// kMaxRules sized to comfortably fit the default rule set seeded at install
-// (~14 entries) plus a couple of slots for user additions. Bumping this is
-// cheap (zero-init storage, fixed-stride array).
-constexpr size_t kMaxRules     = 16;
+// kMaxRules sized to comfortably fit every screen the engine registers at
+// boot (~57 in retail, observed via screen_register hook 2026-05-09) plus
+// headroom for user-added patterns. Bumping this is cheap (zero-init
+// storage, fixed-stride array).
+constexpr size_t kMaxRules     = 96;
 constexpr size_t kPatternBytes = 48;
 
 struct Rule {
@@ -110,7 +119,12 @@ std::mutex  g_mu;
 // the user-reported "micro lag when moving UI elements" on 2026-05-06.
 std::atomic<bool>  g_save_dirty{false};
 std::atomic<DWORD> g_last_save_tick{0};
-constexpr DWORD    kSaveDebounceMs = 250;
+// 1500 ms = comfortably longer than a typical interactive flurry (drag,
+// type-a-name, click another field). Combined with the single-pass save
+// (saves now ~5 ms instead of ~500 ms), the user never sees a save-in-
+// progress hitch — even multi-second editing sequences flush exactly once
+// after the user stops touching anything.
+constexpr DWORD    kSaveDebounceMs = 1500;
 
 bool icase_substr(const char* hay, const char* needle) {
     if (!hay || !needle || !*needle) return false;
@@ -185,13 +199,71 @@ void remove_rule(size_t idx) {
 float default_aspect()             { return g_default_aspect; }
 void  set_default_aspect(float a)  { g_default_aspect = a; }
 
+// Auto-sync flag: when on, sync_from_registry() pulls every name from
+// screen_push's registered list into the rules table on each menu draw.
+// Default OFF — manual "+ Add ALL N known screens" button is the
+// authoritative way to bulk-populate. Auto-sync default ON was wrong:
+// it added rules behind the user's back on every menu open, defeating
+// "Clear all" and creating a save-spike each time.
+std::atomic<bool> g_auto_sync_screens{false};
+
 void clear_all() {
-    std::scoped_lock lk(g_mu);
-    for (size_t i = 0; i < kMaxRules; ++i) {
-        g_rules[i].pattern[0] = 0;
-        g_rules[i].aspect     = 0.0f;
+    {
+        std::scoped_lock lk(g_mu);
+        for (size_t i = 0; i < kMaxRules; ++i) {
+            g_rules[i].pattern[0] = 0;
+            g_rules[i].aspect     = 0.0f;
+        }
+        g_rule_count = 0;
     }
-    g_rule_count = 0;
+    // RULE №1 fix: if auto-sync were left enabled, every menu draw frame
+    // would re-add the registry contents and the user's "Clear all" would
+    // be silently undone. Disable auto-sync atomically with the clear so
+    // the cleared state actually persists. User can re-enable via the
+    // Auto-track checkbox.
+    g_auto_sync_screens.store(false);
+}
+
+bool auto_sync_screens()         { return g_auto_sync_screens.load(); }
+void set_auto_sync_screens(bool v){ g_auto_sync_screens.store(v); }
+
+} // namespace mtr::ui_aspect_rules
+
+// Bridge into screen_push (captures both class-registry names and runtime
+// push instance names; see screen_push.cpp). Forward-declared here so we
+// don't pull a header for one tiny call site.
+namespace mtr::screen_push {
+    int  registered_count();
+    bool registered_at(int idx, char* out, size_t out_size);
+}
+
+namespace mtr::ui_aspect_rules {
+
+// Pull every name from screen_push::registered_* into the rules table,
+// skipping duplicates. Returns the number of newly-added rules. Cheap to
+// call every frame: typical N≈60, M≈60, so ~3600 strcmp ops/frame.
+int sync_from_registry() {
+    const int reg_n = mtr::screen_push::registered_count();
+    if (reg_n <= 0) return 0;
+    int added = 0;
+    std::scoped_lock lk(g_mu);
+    for (int i = 0; i < reg_n; ++i) {
+        char rname[kPatternBytes] = {0};
+        if (!mtr::screen_push::registered_at(i, rname, sizeof(rname))) continue;
+        if (rname[0] == 0) continue;
+        bool dup = false;
+        for (size_t r = 0; r < g_rule_count; ++r) {
+            if (std::strcmp(g_rules[r].pattern, rname) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        if (g_rule_count >= kMaxRules) break;
+        Rule& nr = g_rules[g_rule_count++];
+        std::strncpy(nr.pattern, rname, kPatternBytes - 1);
+        nr.pattern[kPatternBytes - 1] = 0;
+        nr.aspect = 4.0f / 3.0f;
+        ++added;
+    }
+    return added;
 }
 
 // Seed the rule table with sensible defaults for retail Wilbur. Substring
@@ -306,6 +378,13 @@ bool resolve_ini_path(char* out, size_t out_size) {
 
 } // namespace
 
+// Single-pass save: open the file once, fprintf every section + key in one
+// shot, fclose. Replaces ~540 WritePrivateProfileStringA calls (each opens,
+// parses, edits, and rewrites the entire INI in-place) with one open / one
+// write / one close — typically 50-100x faster on a file this size. The
+// FPS drop the user experienced ("30 FPS during apply / save") was the
+// CRT WritePrivateProfile path doing N² work on the file size with each
+// call. Re-readable by GetPrivateProfileStringA on load — same INI format.
 void save_to_ini() {
     char ini[MAX_PATH] = {0};
     if (!resolve_ini_path(ini, sizeof(ini))) return;
@@ -320,96 +399,70 @@ void save_to_ini() {
         snap_default = g_default_aspect;
         for (size_t i = 0; i < snap_count; ++i) snap[i] = g_rules[i];
     }
+    const bool auto_sync = g_auto_sync_screens.load();
 
-    // Wipe the [ui_aspect_rules] section so removed slots don't linger as
-    // stale rule_N_* keys after rule count shrinks. Passing NULL as third
-    // arg deletes the section.
-    WritePrivateProfileStringA("ui_aspect_rules", nullptr, nullptr, ini);
-
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%zu", snap_count);
-    WritePrivateProfileStringA("ui_aspect_rules", "count", buf, ini);
-    std::snprintf(buf, sizeof(buf), "%.6f", snap_default);
-    WritePrivateProfileStringA("ui_aspect_rules", "default_aspect", buf, ini);
-
-    for (size_t i = 0; i < snap_count; ++i) {
-        char keyp[32], keya[32];
-        std::snprintf(keyp, sizeof(keyp), "rule_%zu_pattern", i);
-        std::snprintf(keya, sizeof(keya), "rule_%zu_aspect",  i);
-        WritePrivateProfileStringA("ui_aspect_rules", keyp, snap[i].pattern, ini);
-        std::snprintf(buf, sizeof(buf), "%.6f", snap[i].aspect);
-        WritePrivateProfileStringA("ui_aspect_rules", keya, buf, ini);
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, ini, "wb") != 0 || !fp) {
+        mtr::log::info("ui_aspect_rules: save_to_ini fopen(%s) failed", ini);
+        return;
     }
 
-    // Persist sprite_matrix toggles + live position offset.
-    WritePrivateProfileStringA("sprite_matrix", "enabled",
-        mtr::sprite_matrix::enabled() ? "1" : "0", ini);
-    WritePrivateProfileStringA("sprite_matrix", "auto_from_rules",
-        mtr::sprite_matrix::auto_from_rules() ? "1" : "0", ini);
-    char fbuf[32];
-    std::snprintf(fbuf, sizeof(fbuf), "%.6f", mtr::sprite_matrix::pos_offset_x());
-    WritePrivateProfileStringA("sprite_matrix", "pos_offset_x", fbuf, ini);
-    std::snprintf(fbuf, sizeof(fbuf), "%.6f", mtr::sprite_matrix::pos_offset_y());
-    WritePrivateProfileStringA("sprite_matrix", "pos_offset_y", fbuf, ini);
+    std::fprintf(fp, "[ui_aspect_rules]\r\n");
+    std::fprintf(fp, "count=%zu\r\n", snap_count);
+    std::fprintf(fp, "default_aspect=%.6f\r\n", snap_default);
+    std::fprintf(fp, "auto_sync_screens=%d\r\n", auto_sync ? 1 : 0);
+    for (size_t i = 0; i < snap_count; ++i) {
+        std::fprintf(fp, "rule_%zu_pattern=%s\r\n", i, snap[i].pattern);
+        std::fprintf(fp, "rule_%zu_aspect=%.6f\r\n",  i, snap[i].aspect);
+    }
+
+    std::fprintf(fp, "\r\n[sprite_matrix]\r\n");
+    std::fprintf(fp, "enabled=%d\r\n",        mtr::sprite_matrix::enabled() ? 1 : 0);
+    std::fprintf(fp, "auto_from_rules=%d\r\n",mtr::sprite_matrix::auto_from_rules() ? 1 : 0);
+    std::fprintf(fp, "pos_offset_x=%.6f\r\n", mtr::sprite_matrix::pos_offset_x());
+    std::fprintf(fp, "pos_offset_y=%.6f\r\n", mtr::sprite_matrix::pos_offset_y());
 
     // Persist sprite_xform per-slot transforms. v2 schema includes the
-    // composite-key components (uv_bucket / screen_context / bbox_quadrant).
-    // Slots with all-wildcard patterns omit them or write 0xFFFF / 0xFF —
-    // either way load_apply_full picks the wildcard path. Forward-compatible
-    // with v1 ini files: missing component fields default to wildcard.
-    WritePrivateProfileStringA("sprite_xform", nullptr, nullptr, ini);  // wipe section
+    // composite-key components (uv_bucket / screen_context / bbox_quadrant
+    // / sort_key). Slots with all-wildcard patterns load as wildcard.
     const int xn = mtr::sprite_xform::save_count();
-    std::snprintf(buf, sizeof(buf), "%d", xn);
-    WritePrivateProfileStringA("sprite_xform", "count", buf, ini);
+    std::fprintf(fp, "\r\n[sprite_xform]\r\n");
+    std::fprintf(fp, "count=%d\r\n", xn);
     for (int i = 0; i < xn; ++i) {
         uint32_t sk = 0;
         uint16_t uvb = 0xFFFF;
         uint8_t  sctx = 0xFF;
         uint8_t  quad = 0xFF;
+        uint16_t sortk = 0xFFFF;
         float ox = 0, oy = 0, sx = 1, sy = 1;
         bool hidden = false;
-        char name[48]  = {0};
-        char group[32] = {0};
-        char path[48]  = {0};
-        if (!mtr::sprite_xform::save_at_full(i, &sk, &uvb, &sctx, &quad,
+        char name[48]        = {0};
+        char group[32]       = {0};
+        char path[48]        = {0};
+        char widget_name[48] = {0};
+        if (!mtr::sprite_xform::save_at_full(i, &sk, &uvb, &sctx, &quad, &sortk,
                                              &ox, &oy, &sx, &sy, &hidden,
                                              name, sizeof(name),
                                              group, sizeof(group),
-                                             path, sizeof(path))) continue;
-        char keybuf[32];
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_state_key", i);
-        std::snprintf(buf, sizeof(buf), "0x%08X", sk);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_path", i);
-        WritePrivateProfileStringA("sprite_xform", keybuf, path, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_uv_bucket", i);
-        std::snprintf(buf, sizeof(buf), "0x%04X", uvb);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_screen_context", i);
-        std::snprintf(buf, sizeof(buf), "0x%02X", sctx);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_bbox_quadrant", i);
-        std::snprintf(buf, sizeof(buf), "0x%02X", quad);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_name", i);
-        WritePrivateProfileStringA("sprite_xform", keybuf, name, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_group", i);
-        WritePrivateProfileStringA("sprite_xform", keybuf, group, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_offset_x", i);
-        std::snprintf(buf, sizeof(buf), "%.6f", ox);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_offset_y", i);
-        std::snprintf(buf, sizeof(buf), "%.6f", oy);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_scale_x", i);
-        std::snprintf(buf, sizeof(buf), "%.6f", sx);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_scale_y", i);
-        std::snprintf(buf, sizeof(buf), "%.6f", sy);
-        WritePrivateProfileStringA("sprite_xform", keybuf, buf, ini);
-        std::snprintf(keybuf, sizeof(keybuf), "x_%d_hidden", i);
-        WritePrivateProfileStringA("sprite_xform", keybuf, hidden ? "1" : "0", ini);
+                                             path, sizeof(path),
+                                             widget_name, sizeof(widget_name))) continue;
+        std::fprintf(fp, "x_%d_state_key=0x%08X\r\n",      i, sk);
+        std::fprintf(fp, "x_%d_path=%s\r\n",               i, path);
+        std::fprintf(fp, "x_%d_uv_bucket=0x%04X\r\n",      i, uvb);
+        std::fprintf(fp, "x_%d_screen_context=0x%02X\r\n", i, sctx);
+        std::fprintf(fp, "x_%d_bbox_quadrant=0x%02X\r\n",  i, quad);
+        std::fprintf(fp, "x_%d_sort_key=0x%04X\r\n",       i, sortk);
+        std::fprintf(fp, "x_%d_name=%s\r\n",               i, name);
+        std::fprintf(fp, "x_%d_group=%s\r\n",              i, group);
+        std::fprintf(fp, "x_%d_offset_x=%.6f\r\n",         i, ox);
+        std::fprintf(fp, "x_%d_offset_y=%.6f\r\n",         i, oy);
+        std::fprintf(fp, "x_%d_scale_x=%.6f\r\n",          i, sx);
+        std::fprintf(fp, "x_%d_scale_y=%.6f\r\n",          i, sy);
+        std::fprintf(fp, "x_%d_hidden=%d\r\n",             i, hidden ? 1 : 0);
+        std::fprintf(fp, "x_%d_widget_name=%s\r\n",        i, widget_name);
     }
+
+    std::fclose(fp);
 
     mtr::log::info("ui_aspect_rules: saved %zu rule(s) + %d xform(s) to %s",
                    snap_count, xn, ini);
@@ -454,6 +507,11 @@ bool load_from_ini() {
     GetPrivateProfileStringA("ui_aspect_rules", "default_aspect", "0.0",
                              buf, sizeof(buf), ini);
     float def = static_cast<float>(std::atof(buf));
+
+    // Default OFF when key absent — explicit opt-in only.
+    GetPrivateProfileStringA("ui_aspect_rules", "auto_sync_screens", "0",
+                             buf, sizeof(buf), ini);
+    g_auto_sync_screens.store(std::atoi(buf) != 0);
 
     {
         std::scoped_lock lk(g_mu);
@@ -509,11 +567,13 @@ bool load_from_ini() {
         uint16_t uvb = 0xFFFF;
         uint8_t  sctx = 0xFF;
         uint8_t  quad = 0xFF;
+        uint16_t sortk = 0xFFFF;
         float ox = 0, oy = 0, sx = 1, sy = 1;
         bool hidden = false;
-        char name[48]  = {0};
-        char group[32] = {0};
-        char path[48]  = {0};
+        char name[48]        = {0};
+        char group[32]       = {0};
+        char path[48]        = {0};
+        char widget_name[48] = {0};
         std::snprintf(keybuf, sizeof(keybuf), "x_%d_state_key", i);
         GetPrivateProfileStringA("sprite_xform", keybuf, "0",
                                  buf, sizeof(buf), ini);
@@ -535,6 +595,12 @@ bool load_from_ini() {
         GetPrivateProfileStringA("sprite_xform", keybuf, "0xFF",
                                  buf, sizeof(buf), ini);
         quad = static_cast<uint8_t>(std::strtoul(buf, nullptr, 0) & 0xFF);
+        // Default 0xFFFF = wildcard. Pre-sort_key ini entries (no key) load
+        // as wildcard, matching legacy behaviour exactly.
+        std::snprintf(keybuf, sizeof(keybuf), "x_%d_sort_key", i);
+        GetPrivateProfileStringA("sprite_xform", keybuf, "0xFFFF",
+                                 buf, sizeof(buf), ini);
+        sortk = static_cast<uint16_t>(std::strtoul(buf, nullptr, 0) & 0xFFFF);
         std::snprintf(keybuf, sizeof(keybuf), "x_%d_name", i);
         GetPrivateProfileStringA("sprite_xform", keybuf, "",
                                  name, sizeof(name), ini);
@@ -561,19 +627,27 @@ bool load_from_ini() {
         GetPrivateProfileStringA("sprite_xform", keybuf, "0",
                                  buf, sizeof(buf), ini);
         hidden = std::atoi(buf) != 0;
+        std::snprintf(keybuf, sizeof(keybuf), "x_%d_widget_name", i);
+        GetPrivateProfileStringA("sprite_xform", keybuf, "",
+                                 widget_name, sizeof(widget_name), ini);
 
-        // Phase D.5: prefer path-based matching when a path is recorded.
-        // The pending entry waits in a queue inside sprite_xform until
-        // process_list auto-names a slot whose path matches; then the
-        // queued state is applied (cross-session-robust). Fall back to
-        // raw state_key matching only for legacy entries that have no
-        // path (older v1/v2 ini files written before Phase D.5).
-        if (path[0]) {
-            mtr::sprite_xform::add_pending_by_path(path, uvb, sctx, quad,
+        // Phase 3 (2026-05-09): prefer widget_name-based matching when
+        // a widget_name was recorded — engine-level identity, robust
+        // across sessions AND across atlas-sharing widgets that path
+        // alone can't disambiguate. Falls back to path-based matching
+        // (Phase D.5 robust-against-ASLR), then to raw state_key
+        // matching (least robust, only for entries with neither name
+        // nor path).
+        if (widget_name[0]) {
+            mtr::sprite_xform::add_pending_by_widget_name(widget_name,
+                                                          ox, oy, sx, sy, hidden,
+                                                          name, group);
+        } else if (path[0]) {
+            mtr::sprite_xform::add_pending_by_path(path, uvb, sctx, quad, sortk,
                                                     ox, oy, sx, sy, hidden,
                                                     name, group);
         } else {
-            mtr::sprite_xform::load_apply_full(sk, uvb, sctx, quad,
+            mtr::sprite_xform::load_apply_full(sk, uvb, sctx, quad, sortk,
                                                ox, oy, sx, sy, hidden,
                                                name, group);
         }

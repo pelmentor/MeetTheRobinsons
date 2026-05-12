@@ -49,7 +49,18 @@ add_library(mtr-asi SHARED
     src/dllmain.cpp
     src/log.cpp
     src/menu.cpp
+    src/menu/menu_helpers.cpp
+    src/menu/menu_fps_overlay.cpp
+    src/menu/tab_camera.cpp
+    src/menu/tab_picture.cpp
+    src/menu/tab_world.cpp
+    src/menu/tab_performance.cpp
+    src/menu/tab_tools.cpp
+    src/menu/tab_debug.cpp
     src/d3d9_hook.cpp
+    src/d3d9_hook/camera_hooks.cpp
+    src/d3d9_hook/sprite_hooks.cpp
+    src/d3d9_hook/diag_hooks.cpp
     src/cmdline_hook.cpp
     src/screenshot.cpp
     src/aspect_patch.cpp
@@ -63,14 +74,45 @@ add_library(mtr-asi SHARED
     src/ui_aspect_rules.cpp
     src/vis_test_probe.cpp
     src/scene_vis_log.cpp
+    src/peripheral_cull_probe.cpp
     src/fps_limit.cpp
     src/sprite_probe.cpp
     src/sprite_split.cpp
     src/sprite_xform.cpp
     src/sprite_picking.cpp
     src/state_key_probe.cpp
+    src/widget_probe.cpp
     src/sim_decouple.cpp
+    src/sim_decouple/sim_decouple_throttle.cpp
+    src/sim_decouple/sim_decouple_telemetry.cpp
     src/interp.cpp
+    src/interp/interp_view.cpp
+    src/interp/interp_player.cpp
+    src/interp/interp_npc.cpp
+    src/interp/interp_halo.cpp
+    src/dt_correctness.cpp
+    src/windowmode.cpp
+    src/test_harness.cpp
+    src/crash_handler.cpp
+    src/msaa.cpp
+    src/trigger_overlay.cpp
+    src/npc_overlay.cpp
+    src/prop_overlay.cpp
+    src/entity_kv.cpp
+    src/coop/coop_spawn_probe.cpp
+    src/coop/protagonist_registry.cpp
+    src/coop/coop_vibrate_route.cpp
+    src/coop/coop_registry_mirror.cpp
+    src/coop/engine_player.cpp
+    src/coop/remote_player.cpp
+    src/coop/remote_player_manager.cpp
+    src/coop/net/remote_pose_packet.cpp
+    src/coop/net/net_session.cpp
+    src/coop/input/controlmapper_dev.cpp
+    src/coop/input/per_entity_tick_hook.cpp
+    src/coop/coop_dual_launch.cpp
+    src/cmdline_utils.cpp
+    src/save_system.cpp
 )
 
 target_include_directories(mtr-asi PRIVATE
@@ -86,6 +128,7 @@ target_link_libraries(mtr-asi PRIVATE
     d3d9
     dinput8
     dxguid
+    ws2_32
 )
 
 target_compile_definitions(mtr-asi PRIVATE
@@ -101,6 +144,10 @@ if (MSVC)
     )
     target_link_options(mtr-asi PRIVATE
         /INCREMENTAL:NO
+        # /MAP emits mtr-asi.map next to the .asi — section + symbol table for
+        # offline RVA→symbol lookup without needing dbghelp at runtime.
+        # /MAPINFO:EXPORTS includes exported symbols (cheap, small impact).
+        /MAP /MAPINFO:EXPORTS
         $<$<CONFIG:Release>:/DEBUG:FULL /OPT:REF /OPT:ICF>
     )
 endif()

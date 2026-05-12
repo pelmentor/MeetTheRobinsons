@@ -1,9 +1,11 @@
 // Per-object visibility-test diagnostic probe.
 //
-// `sub_4E0B90` (the per-object visibility test) is a SecuROM-protected
-// 1-instruction thunk: `jmp dword ptr [byte_F5F876+0x340BE]` = `jmp [F92F34]`.
-// SecuROM resolves the IAT slot at runtime to point at the real impl in a
-// decrypted segment.
+// `sub_4E0B90` (the per-object visibility test) is a 1-instruction
+// stolen-byte IAT thunk: `jmp dword ptr [byte_F5F876+0x340BE]` =
+// `jmp [F92F34]`. The IAT slot at 0xF92F34 is filled by the loader
+// (the SecuROM packer's IAT resolver) at process startup, after which
+// it is just a regular IAT slot — the destination is plain code,
+// reachable directly.
 //
 // MinHook'ing the thunk itself was previously unstable (1-byte instruction →
 // fragile trampoline → save-load crashes). Multi-call-site patching (force_vis)
@@ -37,7 +39,7 @@ namespace mtr::vis_test_probe {
 
 namespace {
 
-// IAT slot the SecuROM thunk reads. Address verified via:
+// IAT slot the stolen-byte thunk reads. Address verified via:
 //   sub_4E0B90: `jmp dword ptr byte_F5F876+340BEh`
 //   F5F876 + 340BE = F92F34
 constexpr uintptr_t kIatSlotVA = 0xF92F34;
@@ -148,10 +150,10 @@ static bool try_patch_once() {
 }
 
 static DWORD WINAPI install_poller(LPVOID) {
-    // Poll the IAT slot until SecuROM has resolved it (post-unpack). Most
-    // hooks already install correctly after d3d9.dll loads, but the slot at
-    // 0xF92F34 lives in a SecuROM-managed segment and we can't be sure of
-    // the exact moment it's ready. Poll generously: up to ~30s, every 100ms.
+    // Poll the IAT slot until the loader's packer IAT resolver has filled
+    // it (post-unpack). Most hooks already install correctly after d3d9.dll
+    // loads, but we don't have a precise notification for when this
+    // particular slot is filled. Poll generously: up to ~30s, every 100ms.
     for (int i = 0; i < 300; ++i) {
         if (try_patch_once()) return 0;
         Sleep(100);

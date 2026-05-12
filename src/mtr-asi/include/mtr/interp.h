@@ -92,10 +92,48 @@ void set_view_interp_enabled(bool on);
 // Cumulative count of frames where the view-interp write fired.
 uint64_t view_interp_writes();
 
+// Camera-world-space view interp toggle. When ON (default), the view
+// matrix is interpolated by extracting the camera's world position from
+// each snapshot, lerping the world position, and reconstructing the
+// translation row from interp_R + interp_cam_pos. This is mathematically
+// correct: lerp(view_matrix0, view_matrix1) ≠ inv(lerp(camera0, camera1)).
+// The visible difference is sub-pixel at typical 60Hz sim → 240Hz render
+// but matters for fast camera orbits. Toggle off to A/B test against the
+// older direct-matrix-lerp behaviour.
+bool view_interp_camspace();
+void set_view_interp_camspace(bool on);
+
+// Halo follow-fix client (M3.3) --------------------------------------------
+//
+// Hooks HaloComponent::Update (sub_6678D0 @0x6678D0, vtable[+4] of vtable
+// 0x6DD400) PRE-orig. While the hook fires, temporarily overrides the
+// camera struct's cached view-projection matrix at +0x110 with a
+// view-interp'd version, calls orig (which projects all halos through
+// the interp'd VP), then restores. This eliminates the "halo offset
+// from tagged entity, modulating with camera rotation" bug that view-
+// interp causes — halos use the same interp'd view that the geometry
+// renderer uses.
+//
+// Default OFF — gated alongside view_interp. Auto-vetoed when view-
+// interp itself is OFF or sim_decouple is mini-game-vetoed. When the
+// gate fails the hook trampolines straight to orig with no override.
+
+bool halo_interp_enabled();
+void set_halo_interp_enabled(bool on);
+
+// Cumulative count of render frames where the halo-VP override fired.
+uint64_t halo_interp_writes();
+
+// Cumulative count of render frames where the halo hook bypassed the
+// override (feature off, no snapshots, cut detected, mini-game mode,
+// camera struct unresolved). Diagnostics only.
+uint64_t halo_interp_skips();
+
 // M3.2 — aim-mode snap (input-bound).
 //
 // Engine-side aim detection (`SetPathCamTargetingBehavior` script command
-// callback) lives in SecuROM-thunked code and isn't statically traceable.
+// callback) is registered from the script command-table region — plain
+// code, but we hadn't completed that RE pass when this client shipped.
 // As a pragmatic substitute we poll a user-chosen Windows VK code each
 // render frame; while the key is held, view + player + NPC interp clamp
 // alpha=1.0 (snap to freshest sim, zero interp latency). Default key:
@@ -135,6 +173,66 @@ void post_sim_capture_player();
 float player_teleport_threshold();
 void  set_player_teleport_threshold(float v);
 uint64_t player_teleports_detected();
+
+// Player handle staleness diagnostics. If staleness is real, the
+// "char janky/blurred" report could be partly explained by writing
+// interp values to a freed-then-reused entity slot.
+//
+// player_handle_swaps: count of cache-pointer changes since install.
+// Should be small in steady state — non-zero on level transitions /
+// mode swaps (Wilbur ↔ MiniHamsterPlayer ↔ DigDug ↔ ChargeBall).
+uint64_t player_handle_swaps();
+
+// Force a fresh entity_lookup_by_name_retry on the next call to
+// get_player(). Clears prev/curr snapshots if pointer changes. Useful
+// for debugging mode-switch / level-transition issues from the menu.
+void force_player_handle_refresh();
+
+// Fence-violation diagnostic (M4 specific). Counts render frames
+// where the entity's position differed from what we wrote between
+// camera_apply-POST and next sim_aggregator PRE. Non-zero = something
+// else in the engine modifies entity transforms in our supposed
+// "interp window", invalidating the M4 save-write-restore fence.
+//
+// If this number grows continuously with player_interp ON, the M4
+// approach is unsafe for this engine and we'd need a "shadow render"
+// pattern (intercept the read sites instead of writing the entity).
+uint64_t player_fence_violations();
+
+// Cross-subsystem entity pose primitives -----------------------------------
+//
+// Used by coop/ (MtrRemotePlayer) to hold and apply target poses without
+// linking against interp_internal.h. The struct layout matches the private
+// `detail::PlayerSnap` byte-for-byte; the public wrappers just forward.
+//
+// Engine layout (verified): pos at +0x58 (12 bytes), rotation 3x3 at +0x70
+// (36 bytes, row-major float[9]). Same offsets the M4 player interp uses.
+
+struct EntityPose {
+    float    pos[3];
+    float    rot[9];
+    uint64_t qpc;
+    bool     valid;
+};
+
+// QueryPerformanceCounter sample using the cached frequency. Exposed so
+// coop/ can stamp its snapshots without re-implementing the call.
+uint64_t qpc_now();
+
+// Read engine_entity's pos+rot under SEH. On success, fills `out` with
+// pos/rot + qpc_now() + valid=true and returns true. On AV/fault, leaves
+// `out` unchanged and returns false. Caller decides whether to drop the
+// snapshot or hold the last good one.
+bool capture_entity_pose(const void* engine_entity, EntityPose& out);
+
+// Compose alpha-blend(prev, curr) and write the result into engine_entity's
+// pos+rot fields. When prev.valid is false, snaps to curr (no blend). When
+// curr.valid is false, this is a no-op. Caller is responsible for SEH if
+// the entity pointer is potentially stale — this function does NOT wrap.
+void apply_entity_pose_interp(const EntityPose& prev,
+                              const EntityPose& curr,
+                              float alpha,
+                              void* engine_entity);
 
 // NPC transform interp client (M5) ------------------------------------------
 //

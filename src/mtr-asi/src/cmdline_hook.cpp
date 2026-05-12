@@ -5,6 +5,7 @@
 #include <cwchar>
 #include <stdlib.h>
 
+namespace mtr     { HMODULE self_module(); }
 namespace mtr::log { void info(const char* fmt, ...); }
 
 namespace mtr::cmdline {
@@ -21,6 +22,88 @@ char  g_modified_a[2048] = {};
 WCHAR g_modified_w[2048] = {};
 bool  g_built_a = false;
 bool  g_built_w = false;
+
+// "-letitsnow" is an Easter-egg cmdline flag (Disney/Avalanche). The string
+// lives at 0xF003E4 in the runtime-decompressed `rr01` region; the cmdline
+// flag-parsing happens in the same region as the `-dxwindowed` family
+// (sub_62B050 strstr + per-flag byte global). Direct static xrefs are
+// empty due to register-indirect addressing in rr01, so we can't easily
+// flip the post-parse global at runtime — but injecting "-letitsnow" into
+// argv at boot uses the engine's own activation path. Failure mode is
+// benign (no effect if the flag is dead in retail).
+//
+// Persisted in mtr-asi-ui.ini under [Boot]letitsnow=0|1.
+bool resolve_ini_path(char* out, size_t out_size) {
+    if (!out || out_size < MAX_PATH) return false;
+    HMODULE self = mtr::self_module();
+    char modpath[MAX_PATH] = {0};
+    DWORD got = GetModuleFileNameA(self, modpath, sizeof(modpath));
+    if (got == 0 || got >= sizeof(modpath)) return false;
+    char* slash = std::strrchr(modpath, '\\');
+    if (!slash) slash = std::strrchr(modpath, '/');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    int n = std::snprintf(out, out_size, "%smtr-asi-ui.ini", modpath);
+    return n > 0 && static_cast<size_t>(n) < out_size;
+}
+
+bool read_letitsnow_setting() {
+    char ini[MAX_PATH] = {0};
+    if (!resolve_ini_path(ini, sizeof(ini))) return false;
+    return GetPrivateProfileIntA("Boot", "letitsnow", 0, ini) != 0;
+}
+void write_letitsnow_setting(bool v) {
+    char ini[MAX_PATH] = {0};
+    if (!resolve_ini_path(ini, sizeof(ini))) return;
+    WritePrivateProfileStringA("Boot", "letitsnow", v ? "1" : "0", ini);
+}
+
+// Returns true if the cmdline already contains "-letitsnow" as a token.
+bool has_letitsnow_a(const char* line) {
+    return line && std::strstr(line, "-letitsnow") != nullptr;
+}
+bool has_letitsnow_w(const wchar_t* line) {
+    return line && std::wcsstr(line, L"-letitsnow") != nullptr;
+}
+
+// Returns true if the cmdline contains `-mtrasi-keep-dxresolution`. Used to
+// opt out of the auto-rewrite of -dxresolution to native monitor dims. The
+// rewrite is normally a feature (the Disney launcher passes a tiny default
+// like 320x240 that we bump to native), but the dual-local LAN test harness
+// needs two windowed Wilburs at a small explicit resolution so they can
+// coexist on one screen without fighting for fullscreen-borderless focus.
+bool has_keep_dxres_a(const char* line) {
+    return line && std::strstr(line, "-mtrasi-keep-dxresolution") != nullptr;
+}
+bool has_keep_dxres_w(const wchar_t* line) {
+    return line && std::wcsstr(line, L"-mtrasi-keep-dxresolution") != nullptr;
+}
+
+// Final post-processing: append " -letitsnow" if the user wants it and the
+// rewritten cmdline doesn't already have it. Runs on every successful path
+// of hk_GetCommandLineA / hk_GetCommandLineW (including passthrough cases).
+void maybe_inject_letitsnow_a() {
+    if (!read_letitsnow_setting()) return;
+    if (has_letitsnow_a(g_modified_a)) return;
+    const size_t cur_len = std::strlen(g_modified_a);
+    const char* tok = " -letitsnow";
+    const size_t tok_len = std::strlen(tok);
+    if (cur_len + tok_len + 1 > sizeof(g_modified_a)) return;
+    std::memcpy(g_modified_a + cur_len, tok, tok_len);
+    g_modified_a[cur_len + tok_len] = 0;
+    mtr::log::info("cmdline(A): injected -letitsnow");
+}
+void maybe_inject_letitsnow_w() {
+    if (!read_letitsnow_setting()) return;
+    if (has_letitsnow_w(g_modified_w)) return;
+    const size_t cur_len = std::wcslen(g_modified_w);
+    const wchar_t* tok = L" -letitsnow";
+    const size_t tok_len = std::wcslen(tok);
+    if (cur_len + tok_len + 1 > _countof(g_modified_w)) return;
+    std::memcpy(g_modified_w + cur_len, tok, tok_len * sizeof(WCHAR));
+    g_modified_w[cur_len + tok_len] = 0;
+    mtr::log::info("cmdline(W): injected -letitsnow");
+}
 
 void native_dims(int& w, int& h) {
     HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
@@ -78,6 +161,21 @@ LPSTR WINAPI hk_GetCommandLineA() {
     LPSTR orig = g_orig_A();
     if (!orig) return orig;
 
+    // -mtrasi-keep-dxresolution: opt-out of the native-dims rewrite. Pass
+    // the original cmdline through unmodified (still through the modified
+    // buffer so letitsnow injection can run).
+    if (has_keep_dxres_a(orig)) {
+        size_t n = std::strlen(orig);
+        if (n >= sizeof(g_modified_a)) n = sizeof(g_modified_a) - 1;
+        std::memcpy(g_modified_a, orig, n);
+        g_modified_a[n] = 0;
+        mtr::log::info("cmdline(A): -mtrasi-keep-dxresolution present, "
+                       "passthrough");
+        maybe_inject_letitsnow_a();
+        g_built_a = true;
+        return g_modified_a;
+    }
+
     int nativeW = 0, nativeH = 0;
     native_dims(nativeW, nativeH);
 
@@ -102,6 +200,7 @@ LPSTR WINAPI hk_GetCommandLineA() {
             mtr::log::info("cmdline(A) orig: %s", orig);
             mtr::log::info("cmdline(A) new : %s", g_modified_a);
         }
+        maybe_inject_letitsnow_a();
         g_built_a = true;
         return g_modified_a;
     }
@@ -115,6 +214,7 @@ LPSTR WINAPI hk_GetCommandLineA() {
         if (n >= sizeof(g_modified_a)) n = sizeof(g_modified_a) - 1;
         memcpy(g_modified_a, orig, n);
         g_modified_a[n] = 0;
+        maybe_inject_letitsnow_a();
         g_built_a = true;
         return g_modified_a;
     }
@@ -127,6 +227,7 @@ LPSTR WINAPI hk_GetCommandLineA() {
         if (n >= sizeof(g_modified_a)) n = sizeof(g_modified_a) - 1;
         memcpy(g_modified_a, orig, n);
         g_modified_a[n] = 0;
+        maybe_inject_letitsnow_a();
         g_built_a = true;
         return g_modified_a;
     }
@@ -139,6 +240,7 @@ LPSTR WINAPI hk_GetCommandLineA() {
     mtr::log::info("cmdline(A): %dx%d -> %dx%d", origW, origH, nativeW, nativeH);
     mtr::log::info("cmdline(A) orig: %s", orig);
     mtr::log::info("cmdline(A) new : %s", g_modified_a);
+    maybe_inject_letitsnow_a();
     g_built_a = true;
     return g_modified_a;
 }
@@ -148,6 +250,18 @@ LPWSTR WINAPI hk_GetCommandLineW() {
 
     LPWSTR orig = g_orig_W();
     if (!orig) return orig;
+
+    if (has_keep_dxres_w(orig)) {
+        size_t n = std::wcslen(orig);
+        if (n >= _countof(g_modified_w)) n = _countof(g_modified_w) - 1;
+        std::memcpy(g_modified_w, orig, n * sizeof(WCHAR));
+        g_modified_w[n] = 0;
+        mtr::log::info("cmdline(W): -mtrasi-keep-dxresolution present, "
+                       "passthrough");
+        maybe_inject_letitsnow_w();
+        g_built_w = true;
+        return g_modified_w;
+    }
 
     int nativeW = 0, nativeH = 0;
     native_dims(nativeW, nativeH);
@@ -170,6 +284,7 @@ LPWSTR WINAPI hk_GetCommandLineW() {
             g_modified_w[orig_len + ap_len] = 0;
             mtr::log::info("cmdline(W): no -dxresolution= token, injected %dx%d", nativeW, nativeH);
         }
+        maybe_inject_letitsnow_w();
         g_built_w = true;
         return g_modified_w;
     }
@@ -183,6 +298,7 @@ LPWSTR WINAPI hk_GetCommandLineW() {
         if (n >= _countof(g_modified_w)) n = _countof(g_modified_w) - 1;
         memcpy(g_modified_w, orig, n * sizeof(WCHAR));
         g_modified_w[n] = 0;
+        maybe_inject_letitsnow_w();
         g_built_w = true;
         return g_modified_w;
     }
@@ -195,6 +311,7 @@ LPWSTR WINAPI hk_GetCommandLineW() {
         if (n >= _countof(g_modified_w)) n = _countof(g_modified_w) - 1;
         memcpy(g_modified_w, orig, n * sizeof(WCHAR));
         g_modified_w[n] = 0;
+        maybe_inject_letitsnow_w();
         g_built_w = true;
         return g_modified_w;
     }
@@ -205,6 +322,7 @@ LPWSTR WINAPI hk_GetCommandLineW() {
     g_modified_w[prefix_len + num_len + suffix_len] = 0;
 
     mtr::log::info("cmdline(W): %dx%d -> %dx%d", origW, origH, nativeW, nativeH);
+    maybe_inject_letitsnow_w();
     g_built_w = true;
     return g_modified_w;
 }
@@ -238,6 +356,17 @@ void install() {
         return;
     }
     mtr::log::info("cmdline: GetCommandLineA/W hooks armed (A=%p W=%p)", pA, pW);
+}
+
+// Public API for the snow Easter-egg toggle. The setting is persisted in
+// mtr-asi-ui.ini; the cmdline hook re-reads it lazily on the first
+// GetCommandLine call (which happens during CRT init, before menu is up).
+// Toggling at runtime via the menu writes the ini but the cmdline is
+// already cached for THIS process — change takes effect on the NEXT launch.
+bool snow_at_boot()        { return read_letitsnow_setting(); }
+void set_snow_at_boot(bool v) {
+    write_letitsnow_setting(v);
+    mtr::log::info("cmdline: snow_at_boot persisted = %d (effective on next launch)", v ? 1 : 0);
 }
 
 } // namespace mtr::cmdline

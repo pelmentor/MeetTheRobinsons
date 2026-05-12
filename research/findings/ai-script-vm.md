@@ -3,15 +3,20 @@
 How `.sx` AI scripts are parsed, dispatched, registered, and how they
 drive entity behavior. Plus the NavMesh API surface.
 
+> **CORRECTION 2026-05-11**: claim #2 below ("`.sx` is a text-based command language ... NOT bytecode") was wrong about the on-disk format. The `.sx` files in `Game/data/scripts/*.sx` start with `SLNG` magic + 8-byte header + bytecode and contain references to source `.sla` files that are NOT shipped. This document still applies correctly to the inline event strings the C++ side passes through `console_run_text_script` / `console_dispatch_line` — that's a separate surface. For the on-disk script verb catalog (~7,640 identifiers across 184 files) see [coop-phase-0c-sx-command-catalog-2026-05-11.md](coop-phase-0c-sx-command-catalog-2026-05-11.md).
+
 ## TL;DR
 
 1. **Architecture is event-driven, not tick-driven.** Scripts register
    `OnX` callbacks; the engine fires them when X happens. There is **no
    per-frame "tick all AI scripts" pass**. C++ entity classes do the
    per-frame work and emit events to script handlers.
-2. **`.sx` is a text-based command language** — line-based, `;`/`\n`
-   separators, `\\` continuation, `#` comments. NOT bytecode. Each line
-   is a single command parsed at runtime.
+2. **`.sx` (inline event strings) is a text-based command language** —
+   line-based, `;`/`\n` separators, `\\` continuation, `#` comments. Each
+   line is a single command parsed at runtime. This applies to the
+   inline strings passed through `console_dispatch_line` from C++ —
+   NOT to the on-disk `Game/data/scripts/*.sx` bytecode files (see the
+   correction note at the top of this doc).
 3. **Bidirectional registry**: each (name, callback) binding lives in a
    32-byte node on TWO doubly-linked lists (one by name, one by
    callback). Lookup by name OR by callback is O(chain length).

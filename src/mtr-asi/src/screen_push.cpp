@@ -71,6 +71,9 @@ char  g_screen_stack[kMaxStackDepth][kNameBufSize] = {{0}};
 int   g_screen_stack_depth = 0;
 std::mutex g_stack_mu;
 
+// Forward-declare; defined below alongside the registry catalog.
+void registered_add(const char* name);
+
 char __fastcall hk_screen_push(void* this_, void* /*edx*/, const char* name) {
     if (this_ && !g_captured_manager.load()) {
         g_captured_manager.store(this_);
@@ -84,12 +87,26 @@ char __fastcall hk_screen_push(void* this_, void* /*edx*/, const char* name) {
     // not registered for current state) shouldn't displace our "current top"
     // approximation.
     if (rc != 0 && name) {
-        std::scoped_lock lk(g_stack_mu);
-        if (g_screen_stack_depth < kMaxStackDepth) {
-            std::strncpy(g_screen_stack[g_screen_stack_depth], name, kNameBufSize - 1);
-            g_screen_stack[g_screen_stack_depth][kNameBufSize - 1] = 0;
-            ++g_screen_stack_depth;
+        int new_depth = 0;
+        {
+            std::scoped_lock lk(g_stack_mu);
+            if (g_screen_stack_depth < kMaxStackDepth) {
+                std::strncpy(g_screen_stack[g_screen_stack_depth], name, kNameBufSize - 1);
+                g_screen_stack[g_screen_stack_depth][kNameBufSize - 1] = 0;
+                ++g_screen_stack_depth;
+            }
+            new_depth = g_screen_stack_depth;
         }
+        // Capture the runtime INSTANCE name into the bulk-add registry so
+        // the per-screen rules UI can offer it. Class registry names from
+        // hk_screen_register (e.g. ScreenWilburGameSelect) DON'T match what
+        // current_top_name returns at runtime (e.g. "GameSelectScreen").
+        registered_add(name);
+        // Pre-Phase-1 persistence diagnostic (2026-05-09): mark every
+        // screen transition so [diag new state_key] / [diag specialize]
+        // events in the log can be correlated with screen changes.
+        mtr::log::info("[diag] screen_push: depth=%d name=\"%s\"",
+                       new_depth, name);
     }
     return rc;
 }
@@ -102,16 +119,56 @@ char __fastcall hk_screen_push(void* this_, void* /*edx*/, const char* name) {
 // mirror returns an outdated name — same as the pre-pop-hook behavior.
 int __fastcall hk_screen_pop(void* this_, void* /*edx*/) {
     int rc = g_orig_pop(this_, nullptr);
+    int new_depth = 0;
+    char popped_name[kNameBufSize] = {0};
     {
         std::scoped_lock lk(g_stack_mu);
         if (g_screen_stack_depth > 0) {
             --g_screen_stack_depth;
+            std::strncpy(popped_name,
+                         g_screen_stack[g_screen_stack_depth],
+                         kNameBufSize - 1);
             // Zero out the popped slot so a leak doesn't leave a stale
             // name visible in current_top_name if the depth ever wraps.
             g_screen_stack[g_screen_stack_depth][0] = 0;
         }
+        new_depth = g_screen_stack_depth;
     }
+    // Pre-Phase-1 persistence diagnostic (2026-05-09): pair pushes with
+    // pops in the log so a transition (push X, pop Y, push X again) is
+    // unambiguous from a single grep.
+    mtr::log::info("[diag] screen_pop: depth=%d popped=\"%s\"",
+                   new_depth, popped_name[0] ? popped_name : "(unknown)");
     return rc;
+}
+
+// Static catalog of every screen name we've seen — both engine class names
+// (registered at boot via sub_60E9F0 into the 0x744A80 registry) AND
+// runtime instance names (pushed via sub_604310 — those come from .sc
+// files at engine runtime and DON'T match the class-registry names; e.g.
+// class ScreenWilburGameSelect pushes instance "GameSelectScreen").
+//
+// The user-facing per-screen rules need the INSTANCE names because that's
+// what matches `current_top_name`, so we have to merge both lists. Cap
+// sized for ~57 class names + ~30 instance names + headroom.
+constexpr int kRegisteredCap = 128;
+char  g_registered_names[kRegisteredCap][kNameBufSize] = {{0}};
+int   g_registered_count = 0;
+std::mutex g_registry_mu;
+
+// Add `name` to the de-duplicated registered-names list. Safe to call from
+// either the register-class path or the push-instance path.
+void registered_add(const char* name) {
+    if (!name || !name[0]) return;
+    std::scoped_lock lk(g_registry_mu);
+    for (int i = 0; i < g_registered_count; ++i) {
+        if (std::strcmp(g_registered_names[i], name) == 0) return;
+    }
+    if (g_registered_count >= kRegisteredCap) return;
+    std::strncpy(g_registered_names[g_registered_count],
+                 name, kNameBufSize - 1);
+    g_registered_names[g_registered_count][kNameBufSize - 1] = 0;
+    ++g_registered_count;
 }
 
 int __cdecl hk_screen_register(void* registry, const char* name, void* ctor) {
@@ -120,6 +177,7 @@ int __cdecl hk_screen_register(void* registry, const char* name, void* ctor) {
     if (registry == reinterpret_cast<void*>(kScreenRegistryVA)) {
         mtr::log::info("screen_register: name=\"%s\" ctor=%p",
                        name ? name : "(null)", ctor);
+        registered_add(name);
     }
     return g_orig_register(registry, name, ctor);
 }
@@ -209,6 +267,25 @@ bool current_top_name(char* out, size_t out_size) {
 int stack_depth() {
     std::scoped_lock lk(g_stack_mu);
     return g_screen_stack_depth;
+}
+
+// Public registry API — read-only snapshot of every screen name the engine
+// registered at boot. Used by the per-screen-rules UI to bulk-add rules.
+int registered_count() {
+    std::scoped_lock lk(g_registry_mu);
+    return g_registered_count;
+}
+
+bool registered_at(int idx, char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    std::scoped_lock lk(g_registry_mu);
+    if (idx < 0 || idx >= g_registered_count) {
+        out[0] = 0;
+        return false;
+    }
+    std::strncpy(out, g_registered_names[idx], out_size - 1);
+    out[out_size - 1] = 0;
+    return true;
 }
 
 bool stack_at(int idx, char* out, size_t out_size) {

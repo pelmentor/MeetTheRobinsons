@@ -7,3 +7,9 @@
 [submodule "src/mtr-asi/third_party/imgui"]
 	path = src/mtr-asi/third_party/imgui
 	url = https://github.com/ocornut/imgui.git
+[submodule "third_party/dxvk"]
+	path = third_party/dxvk
+	url = https://github.com/doitsujin/dxvk.git
+[submodule "reference/mtasa-blue"]
+	path = reference/mtasa-blue
+	url = https://github.com/multitheftauto/mtasa-blue.git

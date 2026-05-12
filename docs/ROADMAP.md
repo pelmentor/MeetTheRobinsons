@@ -25,7 +25,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
 - [x] Sanity-checked: strings, imports, function count are real. Hundreds of functions decompiled cleanly via Hex-Rays.
 - [x] Reproducible procedure documented in [`../research/findings/unpack-state.md`](../research/findings/unpack-state.md).
 
-**Known incompleteness (open):** dump was taken at the main menu. Code paths that only run during in-game 3D scenes (notably DirectInput init) are still in their pre-trigger SecuROM lazy-decrypt state and don't appear as instructions in our image. See [`../research/findings/lessons-learned.md`](../research/findings/lessons-learned.md) §L2 for the verified evidence (zero `FF 15 20 60 6A 00` bytes anywhere in the image despite `DirectInput8Create` being called at runtime).
+**Earlier "lazy-decrypt" hypothesis SUPERSEDED 2026-05-05:** initial concern was that code paths only running during in-game 3D scenes (notably DirectInput init) were missing because SecuROM lazily decrypts those blocks. This was wrong. Full RE of the SecuROM 7 stub ([`../research/findings/securom7-stub-re.md`](../research/findings/securom7-stub-re.md)) confirmed the protection has no live encryption — just aPLib decompression at startup. The DInput call site really is missing for a different reason: Wilbur.exe doesn't actually call `DirectInput8Create`; only `Launcher.exe` does. See [`../research/findings/unpack-state.md`](../research/findings/unpack-state.md) §"Dump completeness".
 
 ### M1.5 — Full unpack to a static `Wilbur_unpacked.exe`  ✅ DONE 2026-05-05
 
@@ -152,6 +152,154 @@ Goal: prove the toolchain end-to-end with a no-op mod that just shows it's alive
 - [ ] User-facing README with screenshots and `mtr-asi.ini` reference.
 - [ ] Optional: `Launcher.exe` patch so the launcher's resolution selector and
       `-dxresolution` flag are no longer the only way to set resolution.
+
+---
+
+## M10 — Render-stack modernization ✅ DONE 2026-05-08+
+
+- [x] Migrate from dxwrapper (D3D8 → D3D9 wrapping) to DXVK (D3D9 → Vulkan).
+      ([dxvk-migration-plan-2026-05-08.md](../research/findings/dxvk-migration-plan-2026-05-08.md))
+- [x] Native borderless-fullscreen via [windowmode.cpp](../src/mtr-asi/src/windowmode.cpp)
+      (replaces dxwrapper's `EnableWindowMode` + `FullscreenWindowMode`).
+- [x] DXVK config tuned (`Game/dxvk.conf`): 16x anisotropic, `forceMipmapLodBias=-0.5`,
+      `invariantPosition=True`, `cachedDynamicBuffers=True`, `floatEmulation=Strict`,
+      `maxFrameLatency=1`.
+- [x] MSAA at the API level via [msaa.cpp](../src/mtr-asi/src/msaa.cpp): hooks
+      `IDirect3D9::CreateDevice` + Reset to override `D3DPRESENT_PARAMETERS::MultiSampleType`.
+      Default ON @ 16x with cap-check fallback (16→8→4→2→NONE). Routes through DXVK to
+      native Vulkan multisample.
+- [x] `Direct3DCreate9` early hook from DllMain so CreateDevice-time overrides apply on cold launch.
+
+## M11 — Sim/render decoupling ✅ DONE 2026-05-07
+
+- [x] M0–M6 sim/render decouple landed. View-matrix slerp+lerp, player+NPC interp,
+      halo follow-fix, 0.003-dt-fix exhaustive sweep.
+      ([decouple-m5-m6-plan-complete-2026-05-07.md](../research/findings/decouple-m5-m6-plan-complete-2026-05-07.md))
+- [x] dt-correctness: `flt_6FFCBC` rewrite for ~150 subsystems integrating against
+      hardcoded 0.003s; alt-pump dt correction.
+      ([dt-correctness-root-cause-2026-05-07.md](../research/findings/dt-correctness-root-cause-2026-05-07.md))
+
+## M12 — UI granularity (per-element control) ✅ DONE 2026-05-06+
+
+- [x] Per-element sprite control: composite-key matcher
+      (`state_key + uv_bucket + screen_context + bbox_quadrant + sort_key + widget_name_hash`).
+- [x] Click-to-pick + gizmo overlay; auto-naming from texture loader; ini persistence.
+      ([sprite-per-element-architecture.md](../research/findings/sprite-per-element-architecture.md))
+- [x] Cross-screen Specialize fix: drops `screen_context` from pinning so the same texture
+      role matches across screens (2026-05-09 evening).
+
+## M13 — World-space debug overlays ✅ DONE 2026-05-09
+
+- [x] Trigger-box overlay: 3D-projected wireframe AABBs via ImGui foreground draw list.
+      Homogeneous parametric clip in clip space (6 D3D9 frustum planes). Math validated
+      offline via `tools/validate-overlay-frames.ps1` — 60 frames × 12 edges × 0.5 px tol = PASS.
+      ([trigger-box-overlay-plan-2026-05-09.md](../research/findings/trigger-box-overlay-plan-2026-05-09.md))
+- [x] NPC overlay (Phase 1): walks `dword_724DE4` transform list, reads entity name (+0x50)
+      and pos (`*(entity+0x48)+0x10` → fallback `+0x58`), projects to screen, draws label
+      via ImGui foreground draw list. Walker SEH-guarded; full 6-plane point-frustum cull;
+      strict ASCII validation on names. Shared math header `include/mtr/overlay_math.h`.
+      ([npc-overlay-plan-2026-05-09.md](../research/findings/npc-overlay-plan-2026-05-09.md))
+- [ ] NPC overlay Phase 2: anim state from `entity+0x158` (gated on RE — needs vtable
+      whitelist for non-Player classes).
+- [ ] NPC overlay Phase 3: kv_get registry dump on click-pin (gated on click-handler
+      integration with `sprite_picking`).
+- [ ] Trigger overlay Phase 3: entity walker for `triggerbox` / `trigger_volume` /
+      `triggeraoe` classes (currently only renders a hardcoded test box).
+
+## M14 — Autonomous validation pipeline ✅ DONE 2026-05-09
+
+- [x] In-mod scenario runner ([test_harness.cpp](../src/mtr-asi/src/test_harness.cpp)) with
+      DI-keyboard-injection-driven engine state navigation, JSON results, clean WM_CLOSE
+      shutdown. Scenarios: `boot-to-main-menu`, `verify-main-menu-visible`, `widget-probe`,
+      `hold-at-menu`, `overlay-phase1-verify`, `npc-overlay-phase1-verify`.
+- [x] PowerShell orchestrator [`run-test.ps1`](../tools/run-test.ps1) with 3-layer watchdog
+      (in-mod timeout, log-stall, hard timeout) and per-scenario validator dispatch.
+- [x] Multi-scenario overnight orchestrator [`run-overnight.ps1`](../tools/run-overnight.ps1)
+      adds a 4th layer (outer process kill).
+- [x] Crash handler ([crash_handler.cpp](../src/mtr-asi/src/crash_handler.cpp)) with SEH
+      filter writing minidump + result-JSON sentinel so crashes surface as exit 1 (fail)
+      not exit 4 (launch failure).
+- [x] BMP→PNG thumbnail conversion ([`bmp-to-png-thumb.ps1`](../tools/bmp-to-png-thumb.ps1))
+      so archived screenshots are chat-shareable (~1 MB PNG vs ~11 MB BMP).
+- [x] Usage guide: [AUTONOMOUS_TESTING.md](AUTONOMOUS_TESTING.md).
+
+## M15 — Coop multiplayer (LAN, authoritative-host) 🟡 PHASE 0 ✅ DONE 2026-05-11
+
+Long-running effort. v1 ETA was ~8–10 months for 2-player LAN coop; **Phase 0 RE
+revealed major engine scaffolding that reduces the total by ~10 wk** (see
+"v2 plan revisions" below).
+
+Phase ordering is dependency-strict — Phase 1 (transport) MUST NOT start before
+all of Phase 0 lands. Phase 0 is now closed; Phase 1 design is in
+[coop-phase1-design-2026-05-11.md](../research/findings/coop-phase1-design-2026-05-11.md).
+
+### Plan-level Phase 0 — RE prerequisites ✅ DONE
+
+- [x] **0A — Entity factory RE** ✅ 2026-05-10 + derisk 2026-05-11. `entity_factory_construct` @ 0x5B96F0.
+      Derisk spawned a player2 entity from the mod, all 9 breadcrumbs fire, clean teardown.
+      [coop-phase-0b-breadcrumb-trail-2026-05-10.md](../research/findings/coop-phase-0b-breadcrumb-trail-2026-05-10.md).
+- [x] **0C — .sx script command catalog** ✅ 2026-05-11. 7,640 identifiers from 184 SLNG-bytecode
+      files. **Major finding**: engine has vestigial multi-player scaffolding (`IsMultiPlayer`,
+      `ActorGetNetMaster`, `GenericNetActor`, `Players_*`, `transremote`, `recv`, 4P placements).
+      [coop-phase-0c-sx-command-catalog-2026-05-11.md](../research/findings/coop-phase-0c-sx-command-catalog-2026-05-11.md).
+- [x] **0D — Two-process test harness skeleton** ✅ 2026-05-11. `-mtrasi-coop-port=<N>` +
+      [tools/run-coop-test.ps1](../tools/run-coop-test.ps1). Mock / single-process / dual-machine.
+- [x] **Replication primitive RE** ✅ 2026-05-11. Found functional DistributedState publish/receive
+      pair (`entity_publish_distributed_state` @ 0x5AFDB0, `entity_receive_distributed_state` @ 0x5AFE90)
+      + transform-replication (`entity_publish_netactor_transforms` @ 0x5B06A0). 10 entity vtables
+      participate, including **Protagonist** (player) + wilbur (avatar). Manager pointer at
+      entity+216 is null in SP. [coop-phase0-replication-primitive-found-2026-05-11.md](../research/findings/coop-phase0-replication-primitive-found-2026-05-11.md).
+- [x] **MP install site + activation gate RE** ✅ 2026-05-11. `entity_install_network_manager` @ 0x5B0C70.
+      Activation gate `g_mp_coordinator_ptr` @ 0x745BE8 (12 readers, 0 writers in binary — MP layer was
+      stripped at activation). Protagonist::vtable[49] = `sub_474E90` null stub. Three-tier path to enable
+      MP from mod: write coordinator → patch/hook vtable[49] OR install fn → implement NetworkManager
+      (vtable[10/11/12]). [coop-phase0-mp-install-site-2026-05-11.md](../research/findings/coop-phase0-mp-install-site-2026-05-11.md).
+- [x] **0B — Save-system architecture** ✅ 2026-05-11 (partial — coop-relevant subset). Save dispatcher
+      RE'd; `save_pump_dispatcher` @ 0x575D60 + handlers identified. **Key finding**: "DistributedState"
+      xref scan confirms save and replication use independent serialization paths — coop work won't
+      interfere with save/load. Full save-format RE deferred to Phase 2 prerequisite.
+      [coop-phase0b-save-system-architecture-2026-05-11.md](../research/findings/coop-phase0b-save-system-architecture-2026-05-11.md).
+- [x] **Probe stack shipped (build 681,984)** ✅ 2026-05-11. mtr-asi module `coop_mp_probe` with PRE-logger
+      on install fn + armable MultiplayerCoordinator stub at 0x745BE8 (vtable[5/9] wired) + armable
+      NetworkManager stub installable at entity+216 via POST hook (vtable[3/10/11/12] wired). Cmdline
+      auto-arm (`-mtrasi-coop-mp-armall` etc.) and Debug-tab toggles. Used in 4 live tests 2026-05-11.
+      **DELETED 2026-05-12 per RULE №2** (no migration baggage; rejected-architecture stub for replication
+      via singleton NetworkManager — real coop will use per-entity managers, see Phase 1 plan). Findings
+      preserved in `research/findings/coop-phase0-mp-install-site-2026-05-11.md` and the live-test docs below.
+- [x] **Live-test pass shipped** ✅ 2026-05-11. 4 autonomous tests of the probe stack via
+      `tools/run-test.ps1 -ExtraArgs`. Key findings: (F1) `entity_install_network_manager` is DORMANT
+      in normal load-save play; ~~(F2) engine has built-in input separation primitive at `sub_5A2480`~~
+      **F2 RETRACTED 2026-05-11 evening** — table is a cheat-code dispatcher, not gameplay input;
+      (F3) only vtable[5] is exercised from 5 caller sites, all in cheat-code path. Engine never crashed.
+      [coop-phase0-live-test-findings-2026-05-11.md](../research/findings/coop-phase0-live-test-findings-2026-05-11.md) +
+      [coop-phase0-finding-f2-corrected-2026-05-11.md](../research/findings/coop-phase0-finding-f2-corrected-2026-05-11.md).
+
+### v2 plan revisions (cumulative — includes 2026-05-11 live-test findings)
+
+| Phase | v2 estimate | Revised | Why |
+|---|---|---|---|
+| 0B (save RE) | ~1 wk | hours (partial) | save vs replication confirmed decoupled; full format RE moved to Phase 2 prereq |
+| Phase 1 (transport) | 4 wk | ~5 wk | consumer interface (coordinator + manager classes) is now known, but +1wk for implementing them |
+| Phase 1d (install vector) | (bundled) | 1-1.5 wk | live test 2026-05-11 found `entity_install_network_manager` is dormant in normal play → need different install vector |
+| Phase 2 (input separation) | 4 wk | ~~~1.5 wk~~ **~4 wk (no built-in primitive)** | ~~live test 2026-05-11 found built-in input-separation primitive at `sub_5A2480`~~ — F2 RETRACTED: `sub_5A2480` is a cheat-code dispatcher disable, not input separation. Phase 2 reverts to v2 estimate. See [coop-phase0-finding-f2-corrected-2026-05-11.md](../research/findings/coop-phase0-finding-f2-corrected-2026-05-11.md) |
+| Phase 3 (replication) | 4 wk | **~1 wk** | publish/receive code exists; just implement the manager |
+| Phase 5 (script-VM replication) | 8 wk | ~2-3 wk | primitives likely shared via string-keyed channel naming |
+
+Net: **~9-10 wk reduction** from original v1 estimate (8–10 mo → ~7 mo). Was claimed ~11 wk; revised down after F2 correction.
+
+### Plan-level Phase 1 — UDP transport (next milestone)
+
+Design: [coop-phase1-design-2026-05-11.md](../research/findings/coop-phase1-design-2026-05-11.md).
+
+Scope summary: build the UDP transport, implement the MultiplayerCoordinator + NetworkManager
+classes against the known engine interface, wire to the publish/receive primitives. Phase 1
+absorbs the work that was originally split between Phase 1 (transport) and Phase 3 (replication)
+in the v2 plan.
+
+### Plan-level Phases 2–7 — not started
+
+Phase 2 = 2nd player spawn + input separation, Phase 4 = NPC + prop replication,
+Phase 5 = script VM replication, Phase 6 = save/pause/UI, Phase 7 = stability.
 
 ---
 

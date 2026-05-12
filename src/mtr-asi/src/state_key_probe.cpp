@@ -1,8 +1,13 @@
 // state_key target-memory probe.
 //
-// Phase D static analysis dead-ended on SecuROM: the sprite list pushers,
-// state_key consumers (sub_565CF0), and the texture loader path are all
-// runtime-decrypted, so we can't trace state_key → texture path statically.
+// Phase D's static-RE pass on the texture-loader path stalled when this
+// probe was originally written. The sprite list pushers, state_key
+// consumers (sub_565CF0), and the texture loader sit behind stolen-byte
+// IAT thunks — destinations are plain code (the binary IS unpacked; see
+// `feedback_securom_terminology_2026-05-08` in the auto-memory) — but
+// we hadn't completed that RE iteration when this probe shipped. The
+// runtime probe below is still useful even after static RE catches up,
+// because it captures live texture-object layout for cross-checking.
 //
 // What we CAN do at runtime: state_key is a heap pointer (the texture/asset
 // object). If we read the bytes at that pointer we can identify the

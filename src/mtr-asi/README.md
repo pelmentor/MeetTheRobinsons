@@ -33,7 +33,7 @@ Runtime mod that injects features into Wilbur.exe.
 | Feature | Mechanism | Doc |
 |---------|-----------|-----|
 | Cvar dump | Hook all 8 typed-X registration functions (`console_register_var_typed_a..h`); record (group, name, address, caller); button writes `Game/mtr_cvars.txt` (~13.3k entries). | [cvar-system.md](../../research/findings/cvar-system.md) |
-| `vis_test_probe` (IAT-slot diagnostic) | Patch `*(0xF92F34)` (the SecuROM thunk's indirect target) to a wrapper. Counts pass/fail per call site, optional force-pass. | [optimization-systems.md](../../research/findings/optimization-systems.md), [render-pipeline.md](../../research/findings/render-pipeline.md) |
+| `vis_test_probe` (IAT-slot diagnostic) | Patch `*(0xF92F34)` (the stolen-byte IAT thunk's indirect target) to a wrapper. Counts pass/fail per call site, optional force-pass. | [optimization-systems.md](../../research/findings/optimization-systems.md), [render-pipeline.md](../../research/findings/render-pipeline.md) |
 | Multi-site `force_vis` | 5-byte call-site rewrite (`mov al,1; nop*3`) at all 4 sites of `sub_4E0B90` (vis_test). | [optimization-systems.md](../../research/findings/optimization-systems.md) |
 | `scene_vis_log` (visibility-write tracker) | Hooks `scene_set_visible` (sub_4AABC0) + `script_set_instance_hidden` (sub_5E3DC0). Per-frame counters: hides, shows, script invocations + hide/show classification via post-call bit-0 inspection. Sticky log of last 8 distinct scene addrs hidden this frame. Resolves whether the corner-cull is script-driven (counters spike at corners) or upstream (counters flat). | [optimization-systems.md](../../research/findings/optimization-systems.md) |
 | Sprite-batcher matrix override (UI aspect) | Hooks `transform_apply_scale_via_stack` (sub_562AA0) and `transform_apply_translate_via_stack` (sub_562AE0). Per-arg multipliers for sx/sy/sz and tx/ty/tz. Auto-pillarbox buttons (4:3 / 16:10) compute correct factor; auto-from-rules mode drives sx/tx from `ui_aspect_rules` per-screen. Off by default → zero risk. | [ui-render-investigation.md](../../research/findings/ui-render-investigation.md) |
@@ -125,7 +125,7 @@ For one-shot dev iteration use `Game\run.bat` (which calls `tools/run_game.py`) 
 
 ## Compatibility
 
-This mod targets the **retail DVD build** of Wilbur.exe (SecuROM-7 protected, ImageBase `0x00400000`, no ASLR). Function VAs in `aspect_patch.cpp` and `d3d9_hook.cpp` are baked-in constants that match this build:
+This mod targets the **retail DVD build** of Wilbur.exe (originally SecuROM-7 packed; we work against an unpacked IDB — see `docs/SECUROM.md` for the historical procedure). ImageBase `0x00400000`, no ASLR. Function VAs in `aspect_patch.cpp` and `d3d9_hook.cpp` are baked-in constants that match this build:
 
 | VA           | Symbol                                  |
 |--------------|-----------------------------------------|
@@ -142,7 +142,7 @@ This mod targets the **retail DVD build** of Wilbur.exe (SecuROM-7 protected, Im
 | `0x004E4370` | `anim_evaluate_track`                   |
 | `0x00604310` | `screen_manager_push_by_name`           |
 | `0x00604C90` | `screen_manager_pop_top`                |
-| `0x004E0B90` | `sub_4E0B90` (vis_test SecuROM thunk)   |
+| `0x004E0B90` | `sub_4E0B90` (vis_test 1-instr stolen-byte IAT thunk) |
 | `0x006C750C` | dead-code aspect float (NOT patched at runtime) |
 
 Symbol map: [research/findings/symbol-table.md](../../research/findings/symbol-table.md). For a different build, you'd need to find the corresponding RVAs in your own unpacked dump and update the constants — there's no auto-detection.

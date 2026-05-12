@@ -17,7 +17,7 @@ namespace {
 
 // Reverse-engineered VAs (rr01 in retail Wilbur.exe). Phase 1 RE 2026-05-05.
 // Full reference: research/findings/symbol-table.md §Console / REPL.
-constexpr uintptr_t kConsolePrintfVA   = 0x005873A0;  // SecuROM-thunked print sink
+constexpr uintptr_t kConsolePrintfVA   = 0x005873A0;  // print sink (routes through stolen-byte IAT thunk; destination decompilable)
 constexpr uintptr_t kConsoleDispatchVA = 0x00588DB0;  // dispatch_line(state, line)
 constexpr uintptr_t kConsoleStatePtrVA = 0x007415E0;  // void** at this addr
 
