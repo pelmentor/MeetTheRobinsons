@@ -232,7 +232,401 @@ ensures the precedent is pinned to a known commit.)
 repo. `CLAUDE.md` references it as "the canonical precedent for
 coop architecture decisions".
 
-### 0.1 Is the binary unpacked?
+### 0.1 Repository bootstrap (directory layout + initial files)
+
+A coop-mod project accumulates: source code (mod), research findings
+(RE artifacts), design docs, third-party deps, tooling, and game-
+install scratch. Each kind has a different lifetime and audience.
+Setting up the layout BEFORE writing code prevents the "everything in
+one folder" mess that becomes impossible to navigate after a few
+weeks.
+
+#### 0.1.1 Directory layout
+
+Create this structure at the repo root:
+
+```
+<project-root>/
+├── CLAUDE.md                       # Project rules (RULE №1, RULE №2,
+│                                   # 7 principles, references to docs)
+├── README.md                       # Public-facing what-is-this
+├── .gitignore                      # See template below
+├── .gitmodules                     # Submodule definitions
+│
+├── docs/                           # Stable design documentation
+│   ├── ARCHITECTURE.md             # System architecture overview
+│   ├── ROADMAP.md                  # Phase plan + milestones
+│   ├── COOP_SCOPE.md               # In-scope / out-of-scope (Living)
+│   ├── COOP_METHODOLOGY.md         # This file (drop in from MTR repo)
+│   ├── FEASIBILITY.md              # Phase 0 deliverable
+│   └── AUTONOMOUS_TESTING.md       # Test harness usage
+│
+├── research/                       # RE artifacts (analyst-readable)
+│   └── findings/                   # One markdown per finding, dated
+│       ├── <phase>-<topic>-<YYYY-MM-DD>.md
+│       └── ...
+│
+├── reference/                      # Vendored read-only references
+│   ├── mtasa-blue/                 # Submodule (MTA precedent)
+│   └── <other-refs>/               # PDFs, papers, decompile dumps
+│
+├── src/                            # Mod source code (yours)
+│   └── <mod-name>/                 # e.g. mtr-asi, gta-coop-mod
+│       ├── CMakeLists.txt
+│       ├── README.md
+│       ├── include/<mod-name>/     # Headers
+│       │   ├── <engine-wrap>/      # Principle 7: engine-wrapper layer
+│       │   └── coop/               # Principle 7: gameplay/network layer
+│       ├── src/                    # Implementation
+│       │   ├── <engine-wrap>/
+│       │   └── coop/
+│       └── third_party/            # Submodules: minhook, imgui, etc.
+│
+├── third_party/                    # Project-wide submodules
+│   ├── dxvk/                       # If translating D3D9 to Vulkan
+│   └── <other-deps>/
+│
+├── tools/                          # PowerShell / Python scripts
+│   ├── README.md
+│   ├── run-test.ps1                # Single-process autonomous test
+│   ├── run-coop-test.ps1           # Dual-process LAN test
+│   └── <build-helpers>/
+│
+└── Game/                           # GITIGNORED. Local game install.
+    │                               # Force-add only scripts:
+    ├── <Game>.exe                  # (gitignored)
+    ├── <mod>.asi                   # (gitignored — built artifact)
+    ├── coop-host.bat               # force-added (text script)
+    └── coop-client.bat             # force-added (text script)
+```
+
+**Optional but recommended**:
+```
+ida/                                # IDA Pro project files (.i64
+                                    # gitignored, but folder structure
+                                    # is collaboration-relevant for
+                                    # pre-RE'd function name exports)
+└── exports/                        # Function name lists, struct
+                                    # definitions — commit these
+```
+
+#### 0.1.2 What goes where (decision flow)
+
+When you produce a new artifact, decide its home by what KIND of
+artifact it is:
+
+| Artifact kind | Goes to | Lifetime |
+|---|---|---|
+| RE finding (single function / single struct / single discovery) | `research/findings/<topic>-<date>.md` | Snapshot — frozen at write time, supersede with new dated file |
+| Design / architecture doc | `docs/<TOPIC>.md` | Living — kept in sync with reality |
+| Scope decision (in / out of scope for coop) | `docs/COOP_SCOPE.md` | Living — append to existing sections |
+| Phase plan (what comes next) | `docs/ROADMAP.md` | Living — re-arranged as priorities shift |
+| Project rule (always-on guidance) | `CLAUDE.md` | Living — add only after a real incident teaches the rule |
+| Code (header) | `src/<mod>/include/<mod>/<subsystem>/X.h` | Living |
+| Code (impl) | `src/<mod>/src/<subsystem>/X.cpp` | Living |
+| Tool (PowerShell / Python) | `tools/X.{ps1,py,sh}` | Living |
+| Test harness scenario | Within the mod's test_harness module + a `docs/AUTONOMOUS_TESTING.md` line | Living |
+| Vendored library (with source) | `third_party/X/` (submodule) | Pinned to a known commit |
+| External read-only reference (PDF, dump) | `reference/X.pdf` | Static, rarely changes |
+| Built artifact (DLL, EXE, ASI) | DO NOT COMMIT (`.gitignore`) | Regenerable |
+| Test output (JSON reports, screenshots) | DO NOT COMMIT (`.gitignore`) | Regenerable |
+| User-specific config | DO NOT COMMIT (`.gitignore`) | Per-machine |
+
+**Findings vs. design docs — the distinction matters**:
+
+- `research/findings/` is **append-only history**. Each finding is a
+  snapshot at a point in time. You don't edit old findings; you write
+  a new one that supersedes (with a note linking back).
+- `docs/` is **living truth**. You edit them as understanding evolves.
+  If `ARCHITECTURE.md` says X and X is no longer true, you EDIT it,
+  not append.
+
+This split lets new contributors read `docs/` to learn the current
+state and `research/findings/` to understand HOW the current state
+was reached. The MTR project has ~50 findings under
+`research/findings/coop-*` — each a snapshot of a specific
+investigation moment.
+
+**Why dated filenames in findings**:
+- Two findings on the same topic written months apart MUST coexist
+  (the later supersedes the earlier; both are kept for audit).
+- The date gives you a quick "when was this written" without git
+  blame.
+- Sort order in the directory listing tells you investigation
+  chronology at a glance.
+
+Pattern: `<phase>-<topic>-<YYYY-MM-DD>.md`. Examples:
+- `coop-phase-0a-entity-factory-2026-05-10.md`
+- `coop-phase-1-6-input-routing-2026-05-12.md`
+- `dt-correctness-root-cause-2026-05-07.md`
+
+#### 0.1.3 `.gitignore` template
+
+Copy this into your repo as `.gitignore`. Adjust the game-binary
+extensions for your specific game.
+
+```gitignore
+# ===== Game install — never commit copyrighted binaries =====
+Game/
+*.exe
+*.dll
+*.bik       # Bink Video (adjust per game)
+*.bnk       # Wwise (adjust per game)
+*.dbl       # MTR-specific data files (adjust per game)
+# ... add your game's asset extensions here ...
+
+# ===== IDA Pro working files (per-user, large, regenerable) =====
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.t01
+*.t02
+
+# ===== Inspection scratchpad (per-user) =====
+_inspect/
+
+# ===== Heavy local working data (per-machine, not collab-relevant) =====
+ida/dumps/
+*.7z
+tools/x64dbg_snapshot*/
+__pycache__/
+
+# Autonomous test run artifacts (regenerable, can be gigabytes)
+tools/test-runs/
+
+# Build outputs of vendored deps (regenerable from submodule + build script)
+third_party/*-build/
+
+# ===== Build output =====
+build/
+out/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.ipdb
+*.iobj
+*.asi
+
+# ===== CMake =====
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.in
+compile_commands.json
+
+# ===== IDE =====
+.vs/
+*.user
+*.sln.docstates
+*.suo
+*.userprefs
+.idea/
+.vscode/
+!.vscode/launch.example.json
+!.vscode/tasks.example.json
+
+# ===== OS junk =====
+Thumbs.db
+ehthumbs.db
+.DS_Store
+desktop.ini
+
+# ===== Temporary / log =====
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# ===== Claude Code per-machine config (MCP paths etc.) =====
+.claude/
+
+# ===== Allow-list (override broad bans for our own outputs) =====
+!src/**/*.dll
+!tools/**/*.exe
+```
+
+**Critical**: the `Game/` exclusion is broad to prevent ANY
+copyrighted asset from being committed. Scripts that LIVE in Game/
+(`coop-host.bat`, `coop-client.bat`) must be **force-added** with
+`git add -f Game/coop-*.bat` because they `cd /d "%~dp0"` and need
+to launch from the install location.
+
+#### 0.1.4 Submodules to register
+
+Initial submodules every coop-mod project needs:
+
+```bash
+# MTA precedent (mandatory — see 0.0)
+git submodule add https://github.com/multitheftauto/mtasa-blue.git \
+    reference/mtasa-blue
+
+# Hooking library (mandatory)
+git submodule add https://github.com/TsudaKageyu/minhook.git \
+    src/<mod>/third_party/minhook
+
+# Immediate-mode GUI for mod menu / debug overlays (mandatory)
+git submodule add https://github.com/ocornut/imgui.git \
+    src/<mod>/third_party/imgui
+
+# Optional but common:
+# - D3D9-to-Vulkan translation for old games on modern hardware
+git submodule add https://github.com/doitsujin/dxvk.git \
+    third_party/dxvk
+```
+
+**Pin to known commits.** After adding, immediately `git -C <path>
+checkout <commit>` to a tested version. Don't track upstream HEAD —
+breaking changes ship without warning.
+
+#### 0.1.5 Initial `CLAUDE.md` template
+
+Create `CLAUDE.md` at the repo root with this skeleton. Customize
+the bracketed parts:
+
+```markdown
+# Project rules for Claude
+
+## RULE №1 — No crutches, no quick fixes
+[Copy verbatim from docs/COOP_METHODOLOGY.md "Top-level rules"]
+
+## RULE №2 — No migration baggage
+[Copy verbatim from docs/COOP_METHODOLOGY.md "Top-level rules"]
+
+## The 7 architectural principles
+[Copy from docs/COOP_METHODOLOGY.md, can be condensed]
+
+## Other standing rules
+- Document findings + rename functions in IDB
+- Verify, don't guess
+- Don't reinvent the wheel
+- The mod menu uses Dear ImGui
+- No emojis in code / files unless explicitly requested
+
+## Reading order after a session reset / new conversation
+1. MEMORY.md index (if using auto-memory).
+2. Top entry of memory/ (latest project state).
+3. CLAUDE.md (this file).
+4. docs/COOP_METHODOLOGY.md for architecture decisions.
+5. reference/mtasa-blue/ for precedent.
+6. docs/COOP_SCOPE.md for scope decisions.
+```
+
+The CLAUDE.md is read on every conversation start (Claude Code
+auto-loads it). Keep it concise — long CLAUDE.md eats context
+budget that should go to actual work.
+
+#### 0.1.6 Initial `docs/` files
+
+Create these as skeletons at bootstrap:
+
+- **`docs/ARCHITECTURE.md`**: one paragraph "what is this mod
+  architecturally" + a placeholder for diagrams + a list of the
+  7 principles in summary form. Will grow as you go.
+- **`docs/ROADMAP.md`**: ordered list of phases (Phase 0 ..
+  Phase N). Each phase has: goal, deliverable, status, dates.
+- **`docs/COOP_SCOPE.md`**: skeleton with empty "In scope" and "Out
+  of scope" sections. Populate as scope is decided. Add a header
+  block: *"Anything not listed here is NOT in scope and should not
+  drive code or replication decisions."*
+- **`docs/COOP_METHODOLOGY.md`**: this file. Copy from the MTR repo
+  unchanged.
+- **`docs/FEASIBILITY.md`**: the Phase 0 deliverable. Will be filled
+  in as you answer 0.2 through 0.8 below.
+
+#### 0.1.7 Memory system setup (if using Claude Code)
+
+Claude Code's auto-memory lives **outside** the repo, in:
+
+```
+~/.claude/projects/<flattened-project-path>/memory/
+```
+
+(`<flattened-project-path>` is the absolute path with separators
+swapped: `d--Projects-Programming-MeetTheRobinsons` for example.)
+
+Structure inside `memory/`:
+- `MEMORY.md` — index file, ~150-char-per-line pointers
+- `project_<topic>.md` — project-state memory entries
+- `feedback_<topic>.md` — collaboration feedback memory entries
+- `reference_<topic>.md` — pointers to external references
+
+**Do NOT commit memory to the repo.** It's per-user, per-machine,
+and contains user-specific phrasings. The repo holds AUDITABLE
+state (code, docs, research findings); memory holds COLLABORATION
+state (preferences, patterns, working context).
+
+If you want a colleague to have the same memory entries, write
+shareable parts into `docs/` instead.
+
+#### 0.1.8 Initial commit + push
+
+The first commit should contain ONLY the skeleton:
+
+```bash
+git init
+# Create the layout above with empty / skeleton files
+git add CLAUDE.md README.md .gitignore .gitmodules \
+        docs/ARCHITECTURE.md docs/ROADMAP.md docs/COOP_SCOPE.md \
+        docs/COOP_METHODOLOGY.md docs/FEASIBILITY.md \
+        src/<mod>/CMakeLists.txt src/<mod>/README.md \
+        tools/README.md
+git commit -m "Initial skeleton: docs + .gitignore + submodule pins"
+git push -u origin main
+```
+
+The submodule clone happens via `git submodule add` BEFORE the
+commit; the .gitmodules + submodule pointers go in the same first
+commit.
+
+**Don't commit code yet.** First commit is the project shape, not
+the first hook. Code comes in commits 2+.
+
+#### 0.1.9 Commit conventions for the project
+
+Adopt early:
+- **One topic per commit.** Don't bundle "renamed two functions" +
+  "added a network packet". Each commit gets a one-line title +
+  body explaining the WHY.
+- **Phase tag in commit title** where applicable: `[Phase 1.6]`,
+  `[RE]`, `[docs]`, `[tools]`.
+- **Cross-reference findings**: if a commit implements something
+  documented in a finding, mention the finding file in the body.
+- **Co-author Claude** if Claude wrote substantial portions:
+  `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`.
+
+These aren't enforced; they're conventions. The point is: future-you
+or a new contributor should be able to read `git log --oneline` and
+follow the project's evolution without reading the diffs.
+
+#### 0.1.10 Bootstrap checklist
+
+Don't proceed past Phase 0.1 until ALL of these are TRUE:
+
+- [ ] Directory layout matches 0.1.1 (or close — adapt for your mod
+      name).
+- [ ] `.gitignore` excludes game binaries, build outputs, test
+      artifacts, user-specific configs, IDA working files.
+- [ ] `reference/mtasa-blue/` submodule cloned + pinned (0.0).
+- [ ] `src/<mod>/third_party/{minhook,imgui}/` submodules cloned +
+      pinned.
+- [ ] `CLAUDE.md` has the 2 rules + 7 principles + reading order.
+- [ ] `docs/COOP_METHODOLOGY.md` copied from MTR repo (this file).
+- [ ] `docs/COOP_SCOPE.md` exists as skeleton.
+- [ ] `docs/FEASIBILITY.md` exists (will fill in below).
+- [ ] First commit pushed: skeleton + submodule pointers.
+- [ ] Memory system set up (`MEMORY.md` index in
+      `~/.claude/projects/.../memory/`) if using auto-memory.
+
+### 0.2 Is the binary unpacked?
 
 - Modern AAA games with Denuvo / VMProtect / Themida / IL2CPP =
   effectively impossible without major effort. Don't try.
@@ -243,7 +637,7 @@ coop architecture decisions".
 If the binary is encrypted at runtime and you can't dump a clean
 post-unpack version, **stop here**. The project is not viable.
 
-### 0.2 What's the rendering API?
+### 0.3 What's the rendering API?
 
 - DirectX 8 / 9 = mature hooking ecosystem (D3D9 hook for menu
   overlay, ImGui, etc.).
@@ -254,7 +648,7 @@ post-unpack version, **stop here**. The project is not viable.
 You need to render YOUR overlay (mod menu, debug, HUD). Pick a
 strategy here.
 
-### 0.3 What's the input API?
+### 0.4 What's the input API?
 
 - DirectInput (DI) = old games. Has cooperative-level quirks
   (`DISCL_EXCLUSIVE | DISCL_FOREGROUND` won't allow background poll).
@@ -265,7 +659,7 @@ strategy here.
 You need to inject input (mod menu navigation, synthetic actions for
 autonomous testing). Plan for this.
 
-### 0.4 What's the entity model?
+### 0.5 What's the entity model?
 
 Reverse-engineer the engine's entity/object system to confirm:
 - Is there a clear entity factory? (One function that creates
@@ -282,7 +676,7 @@ the project is much harder. If it ticks for a few seconds and then
 crashes, you have hooks to write. If it ticks indefinitely (rare),
 you have a gift.
 
-### 0.5 What's the script VM?
+### 0.6 What's the script VM?
 
 If the game has a scripting layer (`.sx` in MTR, `.scm` in GTA SA,
 `.gsc` in CoD), the AI / NPCs are likely driven by scripts. This
@@ -292,7 +686,7 @@ client receives state.
 If the game has no scripting and NPC logic is hardcoded in the
 engine, replication is simpler but engine RE is harder.
 
-### 0.6 What's the save format?
+### 0.7 What's the save format?
 
 Saves encode the "world state": which entities exist, their progress,
 inventory, unlock flags. Coop should reuse the host's save (host-
@@ -302,7 +696,7 @@ authoritative). Confirm:
 - Are saves encrypted? (If yes, you'll need to decrypt to read host
   state.)
 
-### 0.7 Is there per-process or per-machine state?
+### 0.8 Is there per-process or per-machine state?
 
 Some games have a per-machine mutex (Steam license check, DRM,
 single-instance enforcement). For LAN coop on the same machine
